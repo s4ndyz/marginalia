@@ -1,0 +1,10 @@
+# uv 项目级配置
+# 使用清华大学 PyPI 镜像源加速依赖下载（国内网络环境下显著提升速度）
+# 这是项目级配置，clone 到任何机器都会自动生效，不影响其他项目或全局 uv 设置
+#
+# 如果某天镜像源失效或者你换到国外网络环境，可以删掉这个文件，
+# 或者临时用命令行覆盖：uv sync --index-url https://pypi.org/simple
+
+[[index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
