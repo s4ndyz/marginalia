@@ -12,6 +12,7 @@ UI 风格参照 iBooks/Apple 的极简风格：
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PySide6.QtCore import QUrl, Qt
@@ -32,30 +33,115 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from core.epub_loader import EpubBook, TocEntry, load_epub
+from core.highlights import Highlight, HighlightStore
 from core.search import ChapterText, SearchResult, build_search_index, search
 
 SIDEBAR_TOC = 0
 SIDEBAR_SEARCH = 1
+
+# JS → Python 消息前缀（高亮操作）
+_HL_PREFIX = "MARGINALIA_HL::"
+
+# highlighter.js 的路径（相对于项目根目录）
+_HIGHLIGHTER_JS_PATH = Path(__file__).parent.parent / "assets" / "web" / "highlighter.js"
+
+# JS 端通过 console.log 这个固定前缀的消息向 Python 上报"滚动到底部"，
+# Python 侧用自定义 QWebEnginePage 拦截 javaScriptConsoleMessage 来接收。
+#
+# 为什么不用 QWebChannel：
+#   QWebChannel 需要加载 qwebchannel.js 这个 Qt 自带的桥接脚本，
+#   但实测发现当前 PySide6 wheel 并没有把这个文件打进 Qt 资源系统里
+#   （:/qtwebchannel/qwebchannel.js 不存在），意味着要自己额外维护这份
+#   第三方 JS 文件。对于"滚动到底部"这种单向、低频的简单信号，
+#   用 console.log + 拦截 console message 是 Qt 官方文档认可的轻量做法，
+#   不引入任何额外文件依赖。
+_BOTTOM_SIGNAL = "MARGINALIA_REACHED_BOTTOM"
+
+# 注入到每个章节页面的 JS：监听滚动事件，到底部时打印约定好的信号字符串。
+# 用阈值(20px)容错，避免因为浮点像素误差导致永远卡在差一点点到底的状态。
+# notified 标记防止在底部反复触发滚动事件时重复上报。
+_SCROLL_WATCHER_JS_TEMPLATE = """
+(function() {
+    if (window.__marginaliaScrollWatcherInstalled) { return; }
+    window.__marginaliaScrollWatcherInstalled = true;
+
+    let notifiedBottom = false;
+
+    function checkBottom() {
+        const scrollTop = window.scrollY;
+        const viewportHeight = window.innerHeight;
+        const fullHeight = document.documentElement.scrollHeight;
+        const threshold = 20;
+        const atBottom = scrollTop + viewportHeight >= fullHeight - threshold;
+
+        if (atBottom && !notifiedBottom) {
+            notifiedBottom = true;
+            console.log("__BOTTOM_SIGNAL__");
+        } else if (!atBottom) {
+            notifiedBottom = false;
+        }
+    }
+
+    window.addEventListener('scroll', checkBottom);
+
+    // 如果整页内容比视口还短（一页就能放下，不会触发滚动事件），
+    // 不能立刻判定为"到底"，否则用户刚翻到一个短章节就会被立刻弹去下一章，
+    // 根本来不及看内容。延迟一小段时间再检查，给用户一个"看到了"的缓冲。
+    setTimeout(checkBottom, 600);
+})();
+"""
+# 用简单字符串替换而不是 f-string/str.format，
+# 因为 JS 代码本身全是花括号，跟 f-string/format 的转义语法冲突，
+# 用 .replace() 这种最朴素的方式反而最不容易出错
+_SCROLL_WATCHER_JS = _SCROLL_WATCHER_JS_TEMPLATE.replace(
+    "__BOTTOM_SIGNAL__", _BOTTOM_SIGNAL
+)
+
+
+class ReaderPage(QWebEnginePage):
+    """
+    自定义 QWebEnginePage，拦截 JS 里的 console.log 消息：
+      - MARGINALIA_REACHED_BOTTOM  → 触发自动翻页
+      - MARGINALIA_HL::{json}      → 高亮操作（创建/更新/删除）
+    """
+
+    def __init__(self, on_reach_bottom, on_highlight_msg, parent=None) -> None:
+        super().__init__(parent)
+        self._on_reach_bottom = on_reach_bottom
+        self._on_highlight_msg = on_highlight_msg
+
+    def javaScriptConsoleMessage(self, level, message, line_number, source_id) -> None:
+        if message == _BOTTOM_SIGNAL:
+            self._on_reach_bottom()
+        elif message.startswith(_HL_PREFIX):
+            payload_str = message[len(_HL_PREFIX):]
+            try:
+                payload = json.loads(payload_str)
+                self._on_highlight_msg(payload)
+            except json.JSONDecodeError:
+                pass
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Marginalia")
-        self.resize(1100, 1100)  # 比之前更宽一点，给侧边栏留空间
+        self.resize(1100, 1100)
 
         self.book: EpubBook | None = None
+        self.epub_path: str = ""
         self.current_chapter_idx: int = 0
         self.search_index: list[ChapterText] = []
-        # 当前激活的搜索结果，跳转时用于拿到 match_start 滚动定位
         self._last_search_results: list[SearchResult] = []
+        self.highlight_store: HighlightStore | None = None
 
         self._build_ui()
         self._build_shortcuts()
-        self.sidebar_container.setVisible(False)  # 没打开书之前不需要侧边栏
+        self.sidebar_container.setVisible(False)
 
     # ------------------------------------------------------------------
     # UI 搭建
@@ -79,6 +165,13 @@ class MainWindow(QMainWindow):
         self.sidebar_container = self._build_sidebar()
         self.web_view = QWebEngineView()
         self.web_view.setStyleSheet("background-color: #fdfdfb;")
+        self.reader_page = ReaderPage(
+            on_reach_bottom=self._on_chapter_scrolled_to_bottom,
+            on_highlight_msg=self._on_highlight_message,
+            parent=self.web_view,
+        )
+        self.web_view.setPage(self.reader_page)
+        self.web_view.loadFinished.connect(self._on_page_loaded)
 
         splitter.addWidget(self.sidebar_container)
         splitter.addWidget(self.web_view)
@@ -174,8 +267,8 @@ class MainWindow(QMainWindow):
         self.toc_tree.setHeaderHidden(True)
         self.toc_tree.setStyleSheet(
             """
-            QTreeWidget { border: none; background-color: transparent; font-size: 13px; }
-            QTreeWidget::item { padding: 5px 4px; }
+            QTreeWidget { border: none; background-color: transparent; font-size: 13px; color: #333; }
+            QTreeWidget::item { padding: 5px 4px; color: #333; }
             QTreeWidget::item:selected { background-color: #e8e6df; color: #000; }
             """
         )
@@ -205,8 +298,8 @@ class MainWindow(QMainWindow):
         self.search_results_list = QListWidget()
         self.search_results_list.setStyleSheet(
             """
-            QListWidget { border: none; background-color: transparent; font-size: 12px; }
-            QListWidget::item { padding: 8px 4px; border-bottom: 1px solid #ebe9e3; }
+            QListWidget { border: none; background-color: transparent; font-size: 12px; color: #333; }
+            QListWidget::item { padding: 8px 4px; border-bottom: 1px solid #ebe9e3; color: #333; }
             QListWidget::item:selected { background-color: #e8e6df; color: #000; }
             """
         )
@@ -287,6 +380,12 @@ class MainWindow(QMainWindow):
             self.title_label.setText("这本书没有可读取的章节")
             return
 
+        # 关闭上一本书的 store，打开新的
+        if self.highlight_store is not None:
+            self.highlight_store.close()
+        self.highlight_store = HighlightStore(epub_path)
+        self.epub_path = str(Path(epub_path).resolve())
+
         self.current_chapter_idx = 0
         self.btn_prev.setEnabled(False)
         self.btn_next.setEnabled(self.book.chapter_count() > 1)
@@ -332,6 +431,83 @@ class MainWindow(QMainWindow):
         if 0 <= chapter_index < self.book.chapter_count():
             self.current_chapter_idx = chapter_index
             self._render_current_chapter()
+
+    def _on_page_loaded(self, ok: bool) -> None:
+        """
+        每次章节页面加载完成后的统一入口：
+          1. 注入滚动到底部监听（自动翻页）
+          2. 注入 highlighter.js（选中文字 → 气泡菜单）
+          3. 还原该章节已保存的高亮
+        """
+        if not ok:
+            return
+        page = self.web_view.page()
+        page.runJavaScript(_SCROLL_WATCHER_JS)
+
+        if _HIGHLIGHTER_JS_PATH.exists():
+            hl_js = _HIGHLIGHTER_JS_PATH.read_text(encoding="utf-8")
+            page.runJavaScript(hl_js)
+
+        self._restore_highlights()
+
+    def _restore_highlights(self) -> None:
+        """把当前章节的已保存高亮数据传给 JS 还原"""
+        if self.highlight_store is None or self.book is None:
+            return
+        highlights_json = self.highlight_store.highlights_to_js_json(
+            book_path=self.epub_path,
+            chapter_index=self.current_chapter_idx,
+        )
+        self.web_view.page().runJavaScript(
+            f"restoreHighlights({highlights_json});"
+        )
+
+    def _on_highlight_message(self, payload: dict) -> None:
+        """
+        处理 JS 上报的高亮操作消息：
+          创建: {action:"create", containerXpath, startOffset, endOffset,
+                 selectedText, color, tempId}
+          删除: {action:"delete", id}   id 可能是数字或字符串形式的数字
+        """
+        if self.highlight_store is None:
+            return
+
+        action = payload.get("action")
+
+        if action == "create":
+            h = Highlight(
+                id=None,
+                book_path=self.epub_path,
+                chapter_index=self.current_chapter_idx,
+                container_xpath=payload["containerXpath"],
+                start_offset=payload["startOffset"],
+                end_offset=payload["endOffset"],
+                selected_text=payload["selectedText"],
+                color=payload.get("color", "yellow"),
+            )
+            saved = self.highlight_store.add(h)
+            temp_id = payload.get("tempId", "")
+            # 把 DOM 里的 tempId 换成真实数据库 id，删除时才能正确定位
+            self.web_view.page().runJavaScript(
+                f"updateHighlightId('{temp_id}', {saved.id});"
+            )
+
+        elif action == "delete":
+            raw_id = payload.get("id")
+            try:
+                # JS 传来的 id 可能是数字也可能是数字字符串，统一转 int
+                db_id = int(float(str(raw_id)))
+                self.highlight_store.delete(db_id)
+            except (ValueError, TypeError):
+                # 如果还是 tempId（"pending_xxx"），说明 Python 还没写库完成，
+                # 这种情况极罕见（用户保存后立刻删除），忽略即可
+                pass
+
+    def _on_chapter_scrolled_to_bottom(self) -> None:
+        if self.book is None:
+            return
+        if self.current_chapter_idx < self.book.chapter_count() - 1:
+            self.next_chapter()
 
     # ------------------------------------------------------------------
     # 目录侧边栏
