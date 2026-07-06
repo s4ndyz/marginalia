@@ -9,9 +9,15 @@
     if (window.__marginaliaHighlighterInstalled) { return; }
     window.__marginaliaHighlighterInstalled = true;
 
-    const MSG_PREFIX  = "MARGINALIA_HL::";
-    const HL_COLOR    = "#FFE066";   // 唯一颜色：黄色
-    const HL_COLOR_KEY = "yellow";
+    const MSG_PREFIX = "MARGINALIA_HL::";
+
+    const COLORS = [
+        { key: "yellow", css: "#FFE066" },
+        { key: "green",  css: "#A8E6A3" },
+        { key: "blue",   css: "#A3C8F5" },
+        { key: "pink",   css: "#F5A3C8" },
+    ];
+    const DEFAULT_COLOR = COLORS[0];
 
     // ------------------------------------------------------------------
     // XPath 工具
@@ -56,7 +62,7 @@
     }
 
     // ------------------------------------------------------------------
-    // 还原工具：XPath → DOM 节点，textContent 偏移 → {node, offset}
+    // 还原工具
     // ------------------------------------------------------------------
 
     function resolveXPath(xpath) {
@@ -76,28 +82,88 @@
             if (acc + len >= targetOffset) { return { node, offset: targetOffset - acc }; }
             acc += len;
         }
-        const last = container.lastChild || container;
-        return { node: last, offset: 0 };
+        // fallback：偏移超出，指向最后一个文本节点末尾
+        const walker2 = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
+        let last = null;
+        while ((node = walker2.nextNode())) { last = node; }
+        return last ? { node: last, offset: last.textContent.length } : { node: container, offset: 0 };
     }
 
     // ------------------------------------------------------------------
-    // DOM wrap / unwrap
+    // 核心 wrap：手动分割文本节点，可靠处理跨元素的长选区
+    //
+    // surroundContents() 的问题：如果选区"切了"某个内联元素（比如 <em>、<a>）
+    // 的一半，它直接抛异常。fallback 的 extractContents+insertNode 会把内容
+    // 从 DOM 里挖走再插回来，时机稍有偏差就在原位留下空节点，渲染成换行。
+    //
+    // 正确做法：用 TreeWalker 遍历选区内的所有文本节点，在起点/终点处
+    // 切割文本节点，然后给每段文本套上一个独立的 <mark>。
+    // 这样不移动任何节点，只在原地插入新元素，不会引起换行问题。
     // ------------------------------------------------------------------
 
-    function wrapRange(range, highlightId) {
+    function makeMark(colorCss, highlightId) {
         const mark = document.createElement("mark");
-        mark.style.backgroundColor = HL_COLOR;
+        mark.style.backgroundColor = colorCss;
         mark.style.borderRadius = "2px";
         mark.style.cursor = "pointer";
         mark.dataset.marginaliaId = String(highlightId);
-        try {
-            range.surroundContents(mark);
-        } catch (_e) {
-            const fragment = range.extractContents();
-            mark.appendChild(fragment);
-            range.insertNode(mark);
-        }
         return mark;
+    }
+
+    /**
+     * 把一个 Range 里的所有文本用 <mark> 包裹起来。
+     * 返回创建的所有 <mark> 元素（一个选区可能跨多个文本节点，
+     * 会生成多个 <mark>，但它们共享同一个 highlightId）。
+     */
+    function wrapRangeSafe(range, colorCss, highlightId) {
+        // 用 TreeWalker 收集选区内所有文本节点
+        const walker = document.createTreeWalker(
+            range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+                ? range.commonAncestorContainer.parentNode
+                : range.commonAncestorContainer,
+            NodeFilter.SHOW_TEXT,
+            null
+        );
+
+        const textNodes = [];
+        let node;
+        while ((node = walker.nextNode())) {
+            // 只要文本节点和选区有重叠，就纳入处理范围
+            if (range.intersectsNode(node)) {
+                textNodes.push(node);
+            }
+        }
+
+        const marks = [];
+        for (const textNode of textNodes) {
+            const nodeStart = range.startContainer === textNode ? range.startOffset : 0;
+            const nodeEnd   = range.endContainer   === textNode ? range.endOffset   : textNode.textContent.length;
+
+            if (nodeStart >= nodeEnd) { continue; } // 空交集，跳过
+
+            // 从文本节点末尾开始切（先切尾再切头，避免偏移失效）
+            if (nodeEnd < textNode.textContent.length) {
+                textNode.splitText(nodeEnd);
+            }
+            if (nodeStart > 0) {
+                textNode.splitText(nodeStart);
+                // splitText 返回后半段，前半段还是 textNode，后半段是新节点
+                // 我们要 wrap 的是后半段
+                const toWrap = textNode.nextSibling;
+                if (!toWrap) { continue; }
+                const mark = makeMark(colorCss, highlightId);
+                toWrap.parentNode.insertBefore(mark, toWrap);
+                mark.appendChild(toWrap);
+                marks.push(mark);
+            } else {
+                // 整个文本节点都在选区内
+                const mark = makeMark(colorCss, highlightId);
+                textNode.parentNode.insertBefore(mark, textNode);
+                mark.appendChild(textNode);
+                marks.push(mark);
+            }
+        }
+        return marks;
     }
 
     function unwrapMark(mark) {
@@ -105,11 +171,17 @@
         if (!parent) { return; }
         while (mark.firstChild) { parent.insertBefore(mark.firstChild, mark); }
         parent.removeChild(mark);
-        parent.normalize(); // 合并相邻文本节点，保持 DOM 整洁
+        parent.normalize();
+    }
+
+    /** 删除某个 highlightId 对应的所有 <mark>（一个高亮可能跨多个文本节点）*/
+    function unwrapById(highlightId) {
+        const marks = document.querySelectorAll(`mark[data-marginalia-id="${highlightId}"]`);
+        marks.forEach(unwrapMark);
     }
 
     // ------------------------------------------------------------------
-    // 气泡菜单（只有删除按钮）
+    // 气泡菜单
     // ------------------------------------------------------------------
 
     let currentBubble = null;
@@ -119,12 +191,13 @@
     }
 
     /**
-     * @param x, y       鼠标位置
-     * @param mode       "new" | "existing"
-     * @param range      mode==="new" 时的选区
-     * @param mark       mode==="existing" 时的 <mark> 元素
+     * @param x, y         鼠标位置
+     * @param mode         "new" | "existing"
+     * @param range        mode==="new" 时的选区 Range
+     * @param highlightId  mode==="existing" 时的高亮 id（string）
+     * @param currentColorCss  mode==="existing" 时当前颜色 CSS 值，用于描边
      */
-    function showBubble(x, y, mode, range, mark) {
+    function showBubble(x, y, mode, range, highlightId, currentColorCss) {
         removeBubble();
 
         const bubble = document.createElement("div");
@@ -132,64 +205,73 @@
             "position:fixed", "z-index:99999",
             "background:#fff", "border:1px solid #ddd",
             "border-radius:8px", "box-shadow:0 4px 16px rgba(0,0,0,.15)",
-            "padding:5px 10px", "display:flex", "align-items:center", "gap:8px",
-            "font-family:system-ui,sans-serif", "font-size:13px",
+            "padding:6px 8px", "display:flex", "align-items:center", "gap:6px",
+            "font-family:system-ui,sans-serif",
         ].join(";");
 
-        if (mode === "new") {
-            // ── 新选区：高亮按钮 + 取消 ──
-            const hlBtn = document.createElement("button");
-            hlBtn.textContent = "高亮";
-            hlBtn.style.cssText = [
-                "border:none", "border-radius:4px", "padding:3px 10px",
-                "background:" + HL_COLOR, "cursor:pointer", "font-size:13px",
+        // 4 个颜色圆点（新选区和已有高亮都显示）
+        for (const c of COLORS) {
+            const btn = document.createElement("button");
+            const isActive = (mode === "existing" && c.css === currentColorCss);
+            btn.style.cssText = [
+                "width:20px", "height:20px", "border-radius:50%",
+                "background:" + c.css,
+                "border:" + (isActive ? "2.5px solid #333" : "1.5px solid rgba(0,0,0,.15)"),
+                "cursor:pointer", "padding:0", "flex-shrink:0",
             ].join(";");
-            hlBtn.addEventListener("click", (e) => {
+            btn.title = c.key;
+
+            btn.addEventListener("click", (e) => {
                 e.stopPropagation();
-                applyAndReport(range);
+                if (mode === "new") {
+                    applyAndReport(range, c.css, c.key);
+                } else {
+                    // 更新颜色：通知 Python，更新 DOM 里所有对应 mark 的背景色
+                    notify({ action: "update_color", id: highlightId, color: c.key });
+                    document.querySelectorAll(`mark[data-marginalia-id="${highlightId}"]`)
+                        .forEach(m => {
+                            m.style.backgroundColor = c.css;
+                            m.dataset.marginaliaColor = c.css;
+                        });
+                }
                 removeBubble();
                 window.getSelection()?.removeAllRanges();
             });
-
-            const cancelBtn = document.createElement("button");
-            cancelBtn.textContent = "取消";
-            cancelBtn.style.cssText = [
-                "border:none", "background:transparent",
-                "cursor:pointer", "color:#888", "font-size:13px",
-            ].join(";");
-            cancelBtn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                removeBubble();
-                window.getSelection()?.removeAllRanges();
-            });
-
-            bubble.appendChild(hlBtn);
-            bubble.appendChild(cancelBtn);
-
-        } else {
-            // ── 已有高亮：只有删除按钮 ──
-            const delBtn = document.createElement("button");
-            delBtn.textContent = "删除高亮";
-            delBtn.style.cssText = [
-                "border:none", "background:transparent",
-                "cursor:pointer", "color:#c00", "font-size:13px",
-            ].join(";");
-            delBtn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                // 从 dataset 实时读取 id（此时已经是 Python 写库后的真实 id）
-                const realId = mark.dataset.marginaliaId;
-                notify({ action: "delete", id: realId });
-                unwrapMark(mark);
-                removeBubble();
-            });
-            bubble.appendChild(delBtn);
+            bubble.appendChild(btn);
         }
+
+        // 分隔线
+        const sep = document.createElement("span");
+        sep.style.cssText = "width:1px;height:18px;background:#e0e0e0;margin:0 2px;flex-shrink:0";
+        bubble.appendChild(sep);
+
+        // 删除按钮
+        const delBtn = document.createElement("button");
+        delBtn.textContent = "✕";
+        delBtn.style.cssText = [
+            "border:none", "background:transparent",
+            "cursor:pointer", "color:#999", "font-size:14px", "padding:0 2px",
+            "line-height:1",
+        ].join(";");
+        delBtn.title = "删除高亮";
+        delBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (mode === "new") {
+                // 还没创建，直接取消
+            } else {
+                notify({ action: "delete", id: highlightId });
+                unwrapById(highlightId);
+            }
+            removeBubble();
+            window.getSelection()?.removeAllRanges();
+        });
+        bubble.appendChild(delBtn);
 
         document.body.appendChild(bubble);
         currentBubble = bubble;
 
         // 定位气泡，避免超出视口
-        const bw = bubble.offsetWidth || 120;
+        const bw = bubble.offsetWidth || 160;
         const bh = bubble.offsetHeight || 36;
         bubble.style.left = Math.min(x, window.innerWidth  - bw - 8) + "px";
         bubble.style.top  = Math.max(y - bh - 10, 8) + "px";
@@ -203,7 +285,19 @@
         console.log(MSG_PREFIX + JSON.stringify(payload));
     }
 
-    function applyAndReport(range) {
+    function attachClickHandlers(marks, highlightId) {
+        marks.forEach(mark => {
+            mark.addEventListener("click", (e) => {
+                e.stopPropagation();
+                // 从 dataset 实时读取（updateHighlightId 更新后自动正确）
+                const id  = mark.dataset.marginaliaId;
+                const css = mark.style.backgroundColor;
+                showBubble(e.clientX, e.clientY, "existing", null, id, css);
+            });
+        });
+    }
+
+    function applyAndReport(range, colorCss, colorKey) {
         const startBlock = nearestBlock(range.startContainer);
         const endBlock   = nearestBlock(range.endContainer);
         const container  = (startBlock === endBlock) ? startBlock : startBlock;
@@ -213,9 +307,9 @@
         const endOffset      = getTextOffset(container, range.endContainer,   range.endOffset);
         const selectedText   = range.toString();
 
-        // 先 wrap DOM 给立即视觉反馈，tempId 用时间戳占位
         const tempId = "pending_" + Date.now();
-        const mark = wrapRange(range, tempId);
+        const marks  = wrapRangeSafe(range, colorCss, tempId);
+        marks.forEach(m => m.dataset.marginaliaColor = colorCss);
 
         notify({
             action: "create",
@@ -223,23 +317,17 @@
             startOffset: startOffset,
             endOffset: endOffset,
             selectedText: selectedText,
-            color: HL_COLOR_KEY,
+            color: colorKey,
             tempId: tempId,
         });
 
-        // 关键：click 事件里从 mark.dataset 实时读 id，
-        // 而不是从闭包捕获 tempId——这样 updateHighlightId 更新 dataset 后，
-        // 点击时能拿到真实的数字 id，删除才能正常工作
-        mark.addEventListener("click", (e) => {
-            e.stopPropagation();
-            showBubble(e.clientX, e.clientY, "existing", null, mark);
-        });
+        attachClickHandlers(marks, tempId);
     }
 
-    // Python 保存成功后，把 tempId 替换成真实数据库 id
+    // Python 保存成功后，把所有 tempId 替换成真实数据库 id
     window.updateHighlightId = function (tempId, realId) {
-        const mark = document.querySelector(`mark[data-marginalia-id="${tempId}"]`);
-        if (mark) { mark.dataset.marginaliaId = String(realId); }
+        document.querySelectorAll(`mark[data-marginalia-id="${tempId}"]`)
+            .forEach(m => { m.dataset.marginaliaId = String(realId); });
     };
 
     // ------------------------------------------------------------------
@@ -260,12 +348,10 @@
                 range.setEnd(end.node, end.offset);
             } catch (_e) { continue; }
 
-            const mark = wrapRange(range, h.id);
-            mark.addEventListener("click", (e) => {
-                e.stopPropagation();
-                // 同样从 dataset 实时读，保持一致
-                showBubble(e.clientX, e.clientY, "existing", null, mark);
-            });
+            const colorCss = h.color; // Python 传来的已是 CSS 色值
+            const marks = wrapRangeSafe(range, colorCss, h.id);
+            marks.forEach(m => m.dataset.marginaliaColor = colorCss);
+            attachClickHandlers(marks, h.id);
         }
     };
 
@@ -283,7 +369,7 @@
                 return;
             }
             const range = sel.getRangeAt(0).cloneRange();
-            showBubble(e.clientX, e.clientY, "new", range, null);
+            showBubble(e.clientX, e.clientY, "new", range, null, null);
         }, 10);
     });
 
