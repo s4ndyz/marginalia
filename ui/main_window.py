@@ -38,6 +38,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from core.epub_loader import EpubBook, TocEntry, load_epub
 from core.highlights import Highlight, HighlightStore
 from core.search import ChapterText, SearchResult, build_search_index, search
+from core.library import import_book
 
 # 左侧侧边栏的三个 tab
 SIDEBAR_TOC    = 0
@@ -195,6 +196,16 @@ class MainWindow(QMainWindow):
         self.btn_next.clicked.connect(self.next_chapter)
         self.btn_next.setEnabled(False)
 
+        self.btn_info = QPushButton("ⓘ")
+        self.btn_info.setToolTip("编辑书籍信息")
+        self.btn_info.setEnabled(False)
+        self.btn_info.clicked.connect(self._open_meta_editor)
+
+        self.btn_edit = QPushButton("✏")
+        self.btn_edit.setToolTip("编辑内容")
+        self.btn_edit.setEnabled(False)
+        self.btn_edit.clicked.connect(self._open_epub_editor)
+
         layout.addWidget(self.btn_back)
         layout.addWidget(self.btn_open)
         layout.addWidget(self.btn_toc)
@@ -203,6 +214,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.btn_prev)
         layout.addWidget(self.title_label, stretch=1)
         layout.addWidget(self.btn_next)
+        layout.addWidget(self.btn_info)
+        layout.addWidget(self.btn_edit)
         return toolbar
 
     def _build_sidebar(self) -> QWidget:
@@ -514,6 +527,13 @@ class MainWindow(QMainWindow):
         if self._on_back_to_library:
             self._on_back_to_library()
 
+    def _open_epub_editor(self) -> None:
+        if not self.epub_path or self.book is None:
+            return
+        from ui.epub_editor import EpubEditorWindow
+        editor = EpubEditorWindow(self.epub_path, self.book, parent=self)
+        editor.show()
+
     def open_file_dialog(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self, "打开 epub 文件", str(Path.home()), "EPUB 文件 (*.epub)"
@@ -549,7 +569,26 @@ class MainWindow(QMainWindow):
         self.notes_list.clear()
 
         self._close_note_drawer()
+        self.btn_info.setEnabled(True)
+        self.btn_edit.setEnabled(True)
         self._render_current_chapter()
+
+    def _open_meta_editor(self) -> None:
+        if not self.epub_path:
+            return
+        from ui.meta_editor import MetaEditorDialog
+        dlg = MetaEditorDialog(self.epub_path, parent=self)
+        if dlg.exec() and dlg.saved_meta:
+            # 更新工具栏标题显示（书名可能变了）
+            chapter = self.book.chapters[self.current_chapter_idx]
+            self.title_label.setText(
+                f"{dlg.saved_meta.title} · {chapter.title}"
+            )
+            # 同步书库记录（如果这本书在书库里）
+            try:
+                import_book(self.epub_path)
+            except Exception:
+                pass
 
     def _render_current_chapter(self) -> None:
         if self.book is None:
