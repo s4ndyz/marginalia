@@ -180,6 +180,45 @@ def import_book(epub_path: str) -> BookRecord | None:
         conn.close()
 
 
+def refresh_book_metadata(epub_path: str) -> BookRecord | None:
+    """
+    重新从 epub 文件读取标题/作者，更新书库里已有的那条记录。
+
+    和 import_book 的区别：import_book 遇到路径已存在会直接返回旧记录、
+    不做任何更新（设计上是"已导入就不重复处理"）；这个函数专门用于
+    "用户在元数据编辑器里改了书名/作者之后，同步书库网格显示"的场景，
+    路径已存在时会真的执行 UPDATE。
+
+    如果这本书原本不在书库里，返回 None——调用方决定要不要转去 import_book。
+    """
+    epub_path = str(Path(epub_path).resolve())
+    if not Path(epub_path).exists():
+        return None
+
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT id FROM books WHERE epub_path = ?", (epub_path,)
+        ).fetchone()
+        if row is None:
+            return None
+
+        title, author = _read_metadata(epub_path)
+        conn.execute(
+            "UPDATE books SET title = ?, author = ? WHERE epub_path = ?",
+            (title, author, epub_path),
+        )
+        conn.commit()
+        updated = conn.execute(
+            "SELECT * FROM books WHERE epub_path = ?", (epub_path,)
+        ).fetchone()
+        return _row_to_record(updated)
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def get_all_books() -> list[BookRecord]:
     """返回所有书，按导入时间倒序。"""
     conn = _get_conn()

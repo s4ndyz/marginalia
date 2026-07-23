@@ -34,7 +34,13 @@
                 if (sib.nodeType === Node.ELEMENT_NODE && sib.tagName === node.tagName) { idx++; }
                 sib = sib.previousSibling;
             }
-            parts.unshift(node.tagName.toLowerCase() + "[" + idx + "]");
+            // 用 local-name() 而非裸标签名：epub 的 XHTML 常被解析为 XML 文档，
+            // 元素会带上 http://www.w3.org/1999/xhtml 命名空间。
+            // document.evaluate() 对不带前缀的裸标签名只匹配"无命名空间"的元素，
+            // 会导致所有 XPath 查找都返回 null。local-name() 只按标签名本身匹配，
+            // 不管元素有没有命名空间，同时兼容普通 HTML 文档。
+            const tag = node.tagName.toLowerCase();
+            parts.unshift("*[local-name()='" + tag + "'][" + idx + "]");
             node = node.parentNode;
         }
         return "/" + parts.join("/");
@@ -213,28 +219,33 @@
         sep1.style.cssText = "width:1px;height:18px;background:#e0e0e0;margin:0 2px;flex-shrink:0";
         bubble.appendChild(sep1);
 
-        // 笔记按钮（只在已有高亮时显示）
-        if (mode === "existing") {
-            const noteBtn = document.createElement("button");
-            noteBtn.textContent = "✎";
-            noteBtn.title = "添加笔记";
-            noteBtn.style.cssText = [
-                "border:none", "background:transparent",
-                "cursor:pointer", "color:#555", "font-size:15px", "padding:0 2px",
-                "line-height:1",
-            ].join(";");
-            noteBtn.addEventListener("click", (e) => {
-                e.stopPropagation();
+        // 笔记按钮：
+        //   new 模式 —— 用默认颜色创建高亮，创建成功后立即打开笔记面板
+        //   existing 模式 —— 直接打开这条高亮的笔记面板
+        const noteBtn = document.createElement("button");
+        noteBtn.textContent = "✎ 笔记";
+        noteBtn.title = "添加笔记";
+        noteBtn.style.cssText = [
+            "border:none", "background:transparent",
+            "cursor:pointer", "color:#555", "font-size:13px", "padding:0 4px",
+            "line-height:1", "white-space:nowrap",
+        ].join(";");
+        noteBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (mode === "new") {
+                applyAndReport(range, DEFAULT_COLOR.css, DEFAULT_COLOR.key, true);
+                window.getSelection()?.removeAllRanges();
+            } else {
                 notify({ action: "open_note", id: highlightId });
-                removeBubble();
-            });
-            bubble.appendChild(noteBtn);
+            }
+            removeBubble();
+        });
+        bubble.appendChild(noteBtn);
 
-            // 分隔线
-            const sep2 = document.createElement("span");
-            sep2.style.cssText = "width:1px;height:18px;background:#e0e0e0;margin:0 2px;flex-shrink:0";
-            bubble.appendChild(sep2);
-        }
+        // 分隔线
+        const sep2 = document.createElement("span");
+        sep2.style.cssText = "width:1px;height:18px;background:#e0e0e0;margin:0 2px;flex-shrink:0";
+        bubble.appendChild(sep2);
 
         // 删除按钮
         const delBtn = document.createElement("button");
@@ -284,7 +295,7 @@
         });
     }
 
-    function applyAndReport(range, colorCss, colorKey) {
+    function applyAndReport(range, colorCss, colorKey, openNoteAfter) {
         const startBlock = nearestBlock(range.startContainer);
         const container  = startBlock;
 
@@ -304,6 +315,7 @@
             selectedText: selectedText,
             color: colorKey,
             tempId: tempId,
+            openNoteAfter: !!openNoteAfter,
         });
 
         attachClickHandlers(marks, tempId);

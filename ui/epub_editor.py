@@ -47,7 +47,9 @@ _EDIT_INIT_JS = """
     document.body.spellcheck = false;
 
     // 注入编辑态样式：光标、选区颜色、去掉默认 outline
+    // 加 id 是为了保存前能精确找到并移除，不污染存回 epub 的内容
     const style = document.createElement('style');
+    style.id = 'marginalia-editor-style';
     style.textContent = `
         body {
             outline: none;
@@ -78,8 +80,42 @@ _EDIT_INIT_JS = """
 })();
 """
 
-# 序列化当前 DOM 为 HTML 字符串（整个 document 的 outerHTML）
-_GET_HTML_JS = "document.documentElement.outerHTML;"
+
+# 序列化当前 DOM 为 HTML 字符串，供保存时写回 epub 使用。
+#
+# 不能直接用 document.documentElement.outerHTML！
+# 那是 HTML 序列化算法，会把 <br/> <img/> 这类自闭合标签
+# 序列化成不闭合的 <br> <img>，而 epub 的 XHTML 内容要求严格
+# 良构 XML —— 未闭合标签会导致这一章下次打开时 XML 解析失败。
+#
+# 改用 XMLSerializer，它按 XML 规则序列化，自闭合标签保持自闭合。
+# 保存前还要清理掉编辑器自己注入的痕迹（contenteditable 属性、
+# 编辑态样式表），否则这些东西会永久写进正文内容里。
+_GET_HTML_JS = """
+(function() {
+    const clone = document.cloneNode(true);
+
+    const styleTag = clone.getElementById('marginalia-editor-style');
+    if (styleTag) { styleTag.remove(); }
+
+    if (clone.body) {
+        clone.body.removeAttribute('contenteditable');
+        clone.body.removeAttribute('spellcheck');
+    }
+
+    // 原文件里的 <?xml ...?> 声明有时会被解析成一个残留的注释节点
+    // （排在 doctype 之前），清掉它，避免和我们下面重新加的声明重复
+    for (const node of Array.from(clone.childNodes)) {
+        if (node.nodeType === Node.COMMENT_NODE && node.data.trim().startsWith('?xml')) {
+            clone.removeChild(node);
+        }
+    }
+
+    const serialized = new XMLSerializer().serializeToString(clone);
+    return '<?xml version="1.0" encoding="utf-8"?>\\n' + serialized;
+})();
+"""
+
 
 
 class EditorPage(QWebEnginePage):

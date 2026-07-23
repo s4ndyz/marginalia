@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -40,6 +41,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from core.epub_loader import EpubBook, TocEntry, load_epub
 from core.highlights import Highlight, HighlightStore
 from core.search import ChapterText, SearchResult, build_search_index, search
+from core.export import export_to_file
 
 SIDEBAR_TOC    = 0
 SIDEBAR_SEARCH = 1
@@ -50,6 +52,7 @@ _HL_PREFIX = "MARGINALIA_HL::"
 
 # highlighter.js 的路径（相对于项目根目录）
 _HIGHLIGHTER_JS_PATH = Path(__file__).parent.parent / "assets" / "web" / "highlighter.js"
+_FOOTNOTES_JS_PATH = Path(__file__).parent.parent / "assets" / "web" / "footnotes.js"
 
 # JS 端通过 console.log 这个固定前缀的消息向 Python 上报"滚动到底部"，
 # Python 侧用自定义 QWebEnginePage 拦截 javaScriptConsoleMessage 来接收。
@@ -65,13 +68,20 @@ _BOTTOM_SIGNAL = "MARGINALIA_REACHED_BOTTOM"
 
 # 注入到每个章节页面的 JS：监听滚动事件，到底部时打印约定好的信号字符串。
 # 用阈值(20px)容错，避免因为浮点像素误差导致永远卡在差一点点到底的状态。
-# notified 标记防止在底部反复触发滚动事件时重复上报。
+#
+# 关键点：碰到底部阈值不能立刻触发翻页——用户往下滚动的过程中，
+# 视口底边瞬间越过阈值的那一刻，最后一行往往还没来得及看完就被跳走了。
+# 所以加一个"停留时间"（DWELL_MS）：碰到底部后先排个定时器，
+# 如果这段时间内用户又往回滚了（不再处于底部），就取消定时器；
+# 只有真的在底部停留够时间，才真正上报"到底了"。
 _SCROLL_WATCHER_JS_TEMPLATE = """
 (function() {
     if (window.__marginaliaScrollWatcherInstalled) { return; }
     window.__marginaliaScrollWatcherInstalled = true;
 
+    const DWELL_MS = 1100;   // 停留多久才判定为"真的读完了，可以翻页"
     let notifiedBottom = false;
+    let bottomTimer = null;
 
     function checkBottom() {
         const scrollTop = window.scrollY;
@@ -80,10 +90,19 @@ _SCROLL_WATCHER_JS_TEMPLATE = """
         const threshold = 20;
         const atBottom = scrollTop + viewportHeight >= fullHeight - threshold;
 
-        if (atBottom && !notifiedBottom) {
-            notifiedBottom = true;
-            console.log("__BOTTOM_SIGNAL__");
-        } else if (!atBottom) {
+        if (atBottom) {
+            if (bottomTimer === null && !notifiedBottom) {
+                bottomTimer = setTimeout(() => {
+                    bottomTimer = null;
+                    notifiedBottom = true;
+                    console.log("__BOTTOM_SIGNAL__");
+                }, DWELL_MS);
+            }
+        } else {
+            if (bottomTimer !== null) {
+                clearTimeout(bottomTimer);
+                bottomTimer = null;
+            }
             notifiedBottom = false;
         }
     }
@@ -91,8 +110,7 @@ _SCROLL_WATCHER_JS_TEMPLATE = """
     window.addEventListener('scroll', checkBottom);
 
     // 如果整页内容比视口还短（一页就能放下，不会触发滚动事件），
-    // 不能立刻判定为"到底"，否则用户刚翻到一个短章节就会被立刻弹去下一章，
-    // 根本来不及看内容。延迟一小段时间再检查，给用户一个"看到了"的缓冲。
+    // 同样要走一遍停留计时，不能因为它是"初始检查"就绕过 DWELL_MS。
     setTimeout(checkBottom, 600);
 })();
 """
@@ -201,7 +219,8 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self._build_toolbar())
 
         # --- 主体：侧边栏 + 阅读区域，用 Splitter 让宽度可拖拽 ---
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter = self.main_splitter
         splitter.setHandleWidth(1)
         splitter.setStyleSheet("QSplitter::handle { background-color: #e5e5e5; }")
 
@@ -390,11 +409,34 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(0)
 
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(14, 0, 10, 6)
+
         header = QLabel("笔记")
         header.setStyleSheet(
-            "font-size: 12px; color: #888; padding: 0 14px 6px; font-weight: 500;"
+            "font-size: 12px; color: #888; font-weight: 500;"
         )
-        layout.addWidget(header)
+        header_row.addWidget(header)
+        header_row.addStretch()
+
+        export_btn = QPushButton("导出")
+        export_btn.setToolTip("导出全部笔记为 Markdown")
+        export_btn.setStyleSheet("""
+            QPushButton {
+                border: 1px solid #d8d6cf; border-radius: 5px;
+                padding: 2px 10px; font-size: 11px; color: #555;
+                background: white;
+            }
+            QPushButton:hover { background: #f0eeea; }
+            QPushButton:disabled { color: #ccc; border-color: #e5e3dd; }
+        """)
+        export_btn.clicked.connect(self._export_notes)
+        self.btn_export_notes = export_btn
+        header_row.addWidget(export_btn)
+
+        header_widget = QWidget()
+        header_widget.setLayout(header_row)
+        layout.addWidget(header_widget)
 
         self.notes_list = QListWidget()
         self.notes_list.setStyleSheet("""
@@ -586,14 +628,23 @@ class MainWindow(QMainWindow):
     def _on_page_loaded(self, ok: bool) -> None:
         """
         每次章节页面加载完成后的统一入口：
-          1. 注入滚动到底部监听（自动翻页）
-          2. 注入 highlighter.js（选中文字 → 气泡菜单）
-          3. 还原该章节已保存的高亮
+          1. 注入排版 CSS
+          2. 注入 footnotes.js（脚注挪到章末 + 跳转/返回），
+             必须在滚动监听之前跑，否则"到底"的判断会用到脚注
+             搬家前的旧页面高度
+          3. 注入滚动到底部监听（自动翻页）
+          4. 注入 highlighter.js（选中文字 → 气泡菜单）
+          5. 还原该章节已保存的高亮
         """
         if not ok:
             return
         page = self.web_view.page()
         page.runJavaScript(_READER_CSS_JS)
+
+        if _FOOTNOTES_JS_PATH.exists():
+            fn_js = _FOOTNOTES_JS_PATH.read_text(encoding="utf-8")
+            page.runJavaScript(fn_js)
+
         page.runJavaScript(_SCROLL_WATCHER_JS)
 
         if _HIGHLIGHTER_JS_PATH.exists():
@@ -643,6 +694,11 @@ class MainWindow(QMainWindow):
             self.web_view.page().runJavaScript(
                 f"updateHighlightId('{temp_id}', {saved.id});"
             )
+            self._refresh_notes_list()
+            # 用户点的是「✎ 笔记」而不是普通颜色圆点：
+            # 高亮已经写库拿到真实 id，直接打开笔记面板，不用等 JS 再报一次 open_note
+            if payload.get("openNoteAfter"):
+                self._open_note_drawer(saved.id)
 
         elif action == "update_color":
             raw_id = payload.get("id")
@@ -810,10 +866,18 @@ class MainWindow(QMainWindow):
         self.note_quote_label.setText(f"\u201c{h.selected_text[:120]}\u201d")
         self.note_edit.setPlainText(h.note or "")
         self.note_drawer.setVisible(True)
+        # 仅 setVisible 不够：splitter 记录的这一格宽度从初始化起就是 0，
+        # 光"可见"但宽度为零等于看不见，必须显式重新分配宽度
+        sizes = self.main_splitter.sizes()
+        sizes[2] = 300
+        self.main_splitter.setSizes(sizes)
         self.note_edit.setFocus()
 
     def _close_note_drawer(self) -> None:
         self.note_drawer.setVisible(False)
+        sizes = self.main_splitter.sizes()
+        sizes[2] = 0
+        self.main_splitter.setSizes(sizes)
         self._current_note_id = None
 
     def _save_note(self) -> None:
@@ -869,11 +933,13 @@ class MainWindow(QMainWindow):
         from ui.meta_editor import MetaEditorDialog
         dlg = MetaEditorDialog(self.epub_path, parent=self)
         if dlg.exec() and dlg.saved_meta:
+            # 同步内存里的 book 对象，笔记列表/导出等地方用到 book.title 时才不会显示旧标题
+            self.book.title = dlg.saved_meta.title
             chapter = self.book.chapters[self.current_chapter_idx]
             self.title_label.setText(f"{dlg.saved_meta.title} · {chapter.title}")
             try:
-                from core.library import import_book
-                import_book(self.epub_path)
+                from core.library import refresh_book_metadata
+                refresh_book_metadata(self.epub_path)
             except Exception:
                 pass
 
@@ -883,4 +949,29 @@ class MainWindow(QMainWindow):
         from ui.epub_editor import EpubEditorWindow
         editor = EpubEditorWindow(self.epub_path, self.book, parent=self)
         editor.show()
+
+    def _export_notes(self) -> None:
+        if self.highlight_store is None or self.book is None or not self.epub_path:
+            return
+
+        highlights = self.highlight_store.get_all(self.epub_path)
+        if not highlights:
+            QMessageBox.information(self, "导出笔记", "这本书还没有任何笔记或高亮。")
+            return
+
+        default_name = f"{self.book.title}-笔记.md"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "导出笔记", str(Path.home() / default_name),
+            "Markdown 文件 (*.md)"
+        )
+        if not save_path:
+            return
+
+        try:
+            export_to_file(self.book, self.highlight_store, self.epub_path, save_path)
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"写入文件时出错：\n{e}")
+            return
+
+        QMessageBox.information(self, "导出成功", f"笔记已导出到：\n{save_path}")
 

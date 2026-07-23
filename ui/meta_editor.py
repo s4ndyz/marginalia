@@ -29,6 +29,18 @@ from PySide6.QtWidgets import (
 from core.epub_meta import EpubMeta, read_meta, write_meta
 
 
+def _short_date(value: str) -> str:
+    """
+    把 ISO 8601 时间戳截断成纯日期，用于展示和编辑。
+    "2021-06-14T17:00:00+00:00" -> "2021-06-14"
+    非标准格式或已经是短日期的原样返回。
+    """
+    value = value.strip()
+    if len(value) >= 10 and value[4] == "-" and value[7] == "-":
+        return value[:10]
+    return value
+
+
 class MetaEditorDialog(QDialog):
     """
     模态对话框，编辑一本 epub 的元数据。
@@ -102,7 +114,8 @@ class MetaEditorDialog(QDialog):
         self._f_author    = _line(self._meta.author)
         self._f_language  = _line(self._meta.language)
         self._f_publisher = _line(self._meta.publisher)
-        self._f_date      = _line(self._meta.date)
+        self._f_date      = _line(_short_date(self._meta.date))
+        self._f_date.setPlaceholderText("YYYY-MM-DD")
 
         self._f_description = QPlainTextEdit(self._meta.description)
         self._f_description.setStyleSheet(_field_style)
