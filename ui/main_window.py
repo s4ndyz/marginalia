@@ -42,6 +42,7 @@ from core.epub_loader import EpubBook, TocEntry, load_epub
 from core.highlights import Highlight, HighlightStore
 from core.search import ChapterText, SearchResult, build_search_index, search
 from core.export import export_to_file
+from core.paths import resource_path
 
 SIDEBAR_TOC    = 0
 SIDEBAR_SEARCH = 1
@@ -50,9 +51,11 @@ SIDEBAR_NOTES  = 2
 # JS → Python 消息前缀（高亮操作）
 _HL_PREFIX = "MARGINALIA_HL::"
 
-# highlighter.js 的路径（相对于项目根目录）
-_HIGHLIGHTER_JS_PATH = Path(__file__).parent.parent / "assets" / "web" / "highlighter.js"
-_FOOTNOTES_JS_PATH = Path(__file__).parent.parent / "assets" / "web" / "footnotes.js"
+# highlighter.js / footnotes.js 的路径
+# 用 resource_path() 而不是直接拼 __file__，是因为打包成 .app 之后
+# __file__ 反推出来的相对路径会失效（见 core/paths.py 里的说明）
+_HIGHLIGHTER_JS_PATH = resource_path("assets", "web", "highlighter.js")
+_FOOTNOTES_JS_PATH = resource_path("assets", "web", "footnotes.js")
 
 # JS 端通过 console.log 这个固定前缀的消息向 Python 上报"滚动到底部"，
 # Python 侧用自定义 QWebEnginePage 拦截 javaScriptConsoleMessage 来接收。
@@ -264,7 +267,7 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(toolbar)
         layout.setContentsMargins(8, 0, 8, 0)
 
-        self.btn_back = QPushButton("‹ 书库")
+        self.btn_back = QPushButton("书库")
         self.btn_back.setVisible(self._on_back_to_library is not None)
         self.btn_back.clicked.connect(self._go_back_to_library)
 
@@ -278,13 +281,13 @@ class MainWindow(QMainWindow):
         self.btn_toc.clicked.connect(self._toggle_toc_sidebar)
 
         # 搜索按钮
-        self.btn_search = QPushButton("⌕")
+        self.btn_search = QPushButton("🔍")
         self.btn_search.setCheckable(True)
         self.btn_search.setToolTip("搜索")
         self.btn_search.clicked.connect(self._toggle_search_sidebar)
 
         # 笔记列表按钮
-        self.btn_notes_list = QPushButton("𝄏")
+        self.btn_notes_list = QPushButton("📝")
         self.btn_notes_list.setCheckable(True)
         self.btn_notes_list.setToolTip("笔记列表")
         self.btn_notes_list.clicked.connect(self._toggle_notes_sidebar)
@@ -306,7 +309,7 @@ class MainWindow(QMainWindow):
         self.btn_info.setEnabled(False)
         self.btn_info.clicked.connect(self._open_meta_editor)
 
-        self.btn_edit = QPushButton("✏")
+        self.btn_edit = QPushButton("✍️")
         self.btn_edit.setToolTip("编辑内容")
         self.btn_edit.setEnabled(False)
         self.btn_edit.clicked.connect(self._open_epub_editor)

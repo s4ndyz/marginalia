@@ -10,3 +10,8 @@ dependencies = [
     "lxml>=6.1.1",
     "pyside6>=6.11.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.11.0",
+]
