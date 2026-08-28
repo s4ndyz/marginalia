@@ -58,70 +58,153 @@ _HL_PREFIX = "MARGINALIA_HL::"
 _HIGHLIGHTER_JS_PATH = resource_path("assets", "web", "highlighter.js")
 _FOOTNOTES_JS_PATH = resource_path("assets", "web", "footnotes.js")
 
-# JS 端通过 console.log 这个固定前缀的消息向 Python 上报"滚动到底部"，
+# JS 端通过 console.log 这个固定前缀的消息向 Python 上报"该翻页了"，
 # Python 侧用自定义 QWebEnginePage 拦截 javaScriptConsoleMessage 来接收。
 #
 # 为什么不用 QWebChannel：
 #   QWebChannel 需要加载 qwebchannel.js 这个 Qt 自带的桥接脚本，
 #   但实测发现当前 PySide6 wheel 并没有把这个文件打进 Qt 资源系统里
 #   （:/qtwebchannel/qwebchannel.js 不存在），意味着要自己额外维护这份
-#   第三方 JS 文件。对于"滚动到底部"这种单向、低频的简单信号，
-#   用 console.log + 拦截 console message 是 Qt 官方文档认可的轻量做法，
-#   不引入任何额外文件依赖。
+#   第三方 JS 文件。对于这种单向、低频的简单信号，用 console.log + 拦截
+#   console message 是 Qt 官方文档认可的轻量做法，不引入额外文件依赖。
 _BOTTOM_SIGNAL = "MARGINALIA_REACHED_BOTTOM"
 
-# 注入到每个章节页面的 JS：监听滚动事件，到底部时打印约定好的信号字符串。
-# 用阈值(20px)容错，避免因为浮点像素误差导致永远卡在差一点点到底的状态。
+# 章末自动翻页：模仿"下拉刷新"的手势——只有当页面已经滚到底、
+# 用户还在持续往下滚/划（一次有分量的下拉动作），才翻页。
 #
-# 关键点：碰到底部阈值不能立刻触发翻页——用户往下滚动的过程中，
-# 视口底边瞬间越过阈值的那一刻，最后一行往往还没来得及看完就被跳走了。
-# 所以加一个"停留时间"（DWELL_MS）：碰到底部后先排个定时器，
-# 如果这段时间内用户又往回滚了（不再处于底部），就取消定时器；
-# 只有真的在底部停留够时间，才真正上报"到底了"。
-_SCROLL_WATCHER_JS_TEMPLATE = """
+# 这是从"停在底部等一段时间就翻页"的旧方案改过来的。旧方案两个问题：
+#   1. 只要停留够时间就翻页，跟用户是不是"读完了想翻页"没关系，
+#      正常阅读时的停顿也会被当成翻页信号，体验上显得很突兀。
+#   2. 一屏就能放下的短章节，天然"已经在底部"，完全不需要用户做任何
+#      动作，每一章都会自动触发，遇上连续几个短章节就变成停不下来的
+#      连续跳转。
+#
+# 新方案把判断依据从"时间+位置"换成"手势"：只有用户在到底之后还
+# 主动做了一个持续的下拉动作，才算数——短章节如果用户什么都不做，
+# 永远不会自动翻页；正常阅读的停顿也不会被误判。
+#
+# 后来又发现一种情况：快速翻阅一整章（一路很快地连续滚动）时，
+# 冲到章末的那个动作本身还带着"惯性尾巴"——最后几个滚动事件
+# 其实是同一个快速滑动动作的延续，而不是用户到底之后重新发起的
+# 下拉。这些事件恰好在滚动位置越过底部的那一刻还在继续，会被误
+# 当成"下拉手势"直接累计过阈值，导致感觉像是"瞬间跳走了"。
+# 用 LANDING_DELAY_MS 处理：刚抵达底部的这一小段时间内，
+# 不响应任何下拉累计，先让画面在底部"停一下"；用户如果真的还想
+# 继续，缓冲期过后再拉一次就行。
+_PULL_TO_NEXT_JS_TEMPLATE = """
 (function() {
-    if (window.__marginaliaScrollWatcherInstalled) { return; }
-    window.__marginaliaScrollWatcherInstalled = true;
+    if (window.__marginaliaPullWatcherInstalled) { return; }
+    window.__marginaliaPullWatcherInstalled = true;
 
-    const DWELL_MS = 1100;   // 停留多久才判定为"真的读完了，可以翻页"
-    let notifiedBottom = false;
-    let bottomTimer = null;
+    const BOTTOM_THRESHOLD_PX = 4;      // 判断"是否已经到底"的容错范围
+    const PULL_THRESHOLD_PX   = 1140;   // 下拉累计够这么多"像素"才触发翻页
+    const IDLE_RESET_MS       = 950;    // 停手超过这么久，之前拉的量作废重新算
+    const LANDING_DELAY_MS    = 450;    // 刚抵达底部的这段时间内不响应下拉，
+                                         // 用来过滤"快速翻阅冲到章末"时残留
+                                         // 的滚动惯性，让画面先在底部停一下
+    const COOLDOWN_MS         = 1000;   // 每次翻页后，新的一章有这么久的"冷静期"
+                                         // 防止上一次下拉的惯性延续到新页面里，
+                                         // 造成连续几章被一口气跳过去
 
-    function checkBottom() {
+    const installedAt = Date.now();
+    let atBottom = false;
+    let bottomArrivedAt = 0;
+    let pullDistance = 0;
+    let lastPullTime = 0;
+    let triggered = false;
+
+    function computeAtBottom() {
         const scrollTop = window.scrollY;
         const viewportHeight = window.innerHeight;
         const fullHeight = document.documentElement.scrollHeight;
-        const threshold = 20;
-        const atBottom = scrollTop + viewportHeight >= fullHeight - threshold;
+        return scrollTop + viewportHeight >= fullHeight - BOTTOM_THRESHOLD_PX;
+    }
 
-        if (atBottom) {
-            if (bottomTimer === null && !notifiedBottom) {
-                bottomTimer = setTimeout(() => {
-                    bottomTimer = null;
-                    notifiedBottom = true;
-                    console.log("__BOTTOM_SIGNAL__");
-                }, DWELL_MS);
-            }
-        } else {
-            if (bottomTimer !== null) {
-                clearTimeout(bottomTimer);
-                bottomTimer = null;
-            }
-            notifiedBottom = false;
+    // 用 scroll 事件而不是 wheel 事件来判断"什么时候抵达底部"，是因为
+    // 快速滑动时，滚动位置的变化（含惯性动画）比 wheel 事件本身更连续、
+    // 更贴近真实画面——这样才能准确捕捉到"刚好越过底部"的那一刻，
+    // 而不是依赖某次 wheel 事件恰好在那时触发。
+    function onScroll() {
+        const nowAtBottom = computeAtBottom();
+        if (nowAtBottom && !atBottom) {
+            // 刚刚抵达底部：记下时间，从这一刻起才允许开始累计下拉手势
+            bottomArrivedAt = Date.now();
+            pullDistance = 0;
+        }
+        if (!nowAtBottom) {
+            pullDistance = 0;
+        }
+        atBottom = nowAtBottom;
+    }
+
+    // 不同输入设备上报的 deltaY 单位不一样：触控板通常是像素，
+    // 鼠标滚轮常见是"行"，极少数是"页"。统一换算成大致的像素量，
+    // 这样阈值才能对两种设备都合理。
+    function normalizedDelta(e) {
+        let delta = e.deltaY;
+        if (e.deltaMode === 1) {        // DOM_DELTA_LINE
+            delta *= 16;
+        } else if (e.deltaMode === 2) { // DOM_DELTA_PAGE
+            delta *= window.innerHeight;
+        }
+        // 单次事件的贡献设个上限，避免某次异常大的 delta 一下子就跨过阈值，
+        // 让"下拉"失去应有的"持续动作"的意味
+        return Math.max(0, Math.min(delta, 80));
+    }
+
+    function onWheel(e) {
+        if (triggered) { return; }
+
+        // 刚翻页过来的这一小段时间，不响应任何下拉——把上一次手势
+        // 可能带来的惯性滤掉，避免连续翻好几章
+        if (Date.now() - installedAt < COOLDOWN_MS) { return; }
+
+        // wheel 事件发生时，先用最新的滚动位置刷新一遍"是否到底"的状态，
+        // 不等下一次 scroll 事件——保证这里用到的 atBottom 足够新鲜
+        onScroll();
+
+        if (!atBottom || e.deltaY <= 0) {
+            // 没到底，或者是在往回滚：当前这次"下拉尝试"作废
+            pullDistance = 0;
+            return;
+        }
+
+        if (Date.now() - bottomArrivedAt < LANDING_DELAY_MS) {
+            // 刚落地，还在缓冲期内——大概率是快速翻阅冲过来的惯性尾巴，
+            // 不算数，直接忽略，让画面先停一下
+            return;
+        }
+
+        const now = Date.now();
+        if (now - lastPullTime > IDLE_RESET_MS) {
+            // 中间停顿太久，之前拉的不算数，重新开始累计
+            pullDistance = 0;
+        }
+        lastPullTime = now;
+
+        pullDistance += normalizedDelta(e);
+
+        if (pullDistance >= PULL_THRESHOLD_PX) {
+            triggered = true;
+            console.log("__BOTTOM_SIGNAL__");
         }
     }
 
-    window.addEventListener('scroll', checkBottom);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('wheel', onWheel, { passive: true });
 
-    // 如果整页内容比视口还短（一页就能放下，不会触发滚动事件），
-    // 同样要走一遍停留计时，不能因为它是"初始检查"就绕过 DWELL_MS。
-    setTimeout(checkBottom, 600);
+    // 立刻同步跑一次：如果整章内容一屏就能放下（一屏内容不会触发任何
+    // scroll 事件），atBottom/bottomArrivedAt 得在这里就确定下来，
+    // 不能指望第一次 wheel 事件里才顺带发现"原来一开始就在底部"——
+    // 那样会把 bottomArrivedAt 错误地记成"用户手势发生的那一刻"，
+    // 平白让用户第一次真实的下拉动作被落地缓冲期挡掉。
+    onScroll();
 })();
 """
 # 用简单字符串替换而不是 f-string/str.format，
 # 因为 JS 代码本身全是花括号，跟 f-string/format 的转义语法冲突，
 # 用 .replace() 这种最朴素的方式反而最不容易出错
-_SCROLL_WATCHER_JS = _SCROLL_WATCHER_JS_TEMPLATE.replace(
+_PULL_TO_NEXT_JS = _PULL_TO_NEXT_JS_TEMPLATE.replace(
     "__BOTTOM_SIGNAL__", _BOTTOM_SIGNAL
 )
 
@@ -719,7 +802,7 @@ class MainWindow(QMainWindow):
             fn_js = _FOOTNOTES_JS_PATH.read_text(encoding="utf-8")
             page.runJavaScript(fn_js)
 
-        page.runJavaScript(_SCROLL_WATCHER_JS)
+        page.runJavaScript(_PULL_TO_NEXT_JS)
 
         if _HIGHLIGHTER_JS_PATH.exists():
             hl_js = _HIGHLIGHTER_JS_PATH.read_text(encoding="utf-8")
