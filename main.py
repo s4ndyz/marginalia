@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QStackedWidget
 
 from ui.library_view import LibraryView
 from ui.main_window import MainWindow
+from ui.theme import ThemeManager, qt_palette
 
 
 class App(QStackedWidget):
@@ -50,6 +51,16 @@ class App(QStackedWidget):
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("Marginalia")
+
+    # Fusion 是唯一一个"完全听 QPalette 指挥"的内置 style——
+    # macOS 原生风格会无视我们设的深色调色板，该亮还是亮。
+    # 这份 palette 主要管 QMessageBox / QFileDialog / 右键菜单这些
+    # 项目里没有手动 setStyleSheet 的原生控件；工具栏/侧边栏这些
+    # 自定义外观各自在 theme.py 描述的"重新上色"方法里处理，互不冲突。
+    app.setStyle("Fusion")
+    theme_mgr = ThemeManager.instance()
+    app.setPalette(qt_palette(theme_mgr.current))
+    theme_mgr.changed.connect(lambda theme: app.setPalette(qt_palette(theme)))
 
     window = App()
     window.show()

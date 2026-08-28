@@ -43,6 +43,7 @@ from core.highlights import Highlight, HighlightStore
 from core.search import ChapterText, SearchResult, build_search_index, search
 from core.export import export_to_file
 from core.paths import resource_path
+from ui.theme import DARK, Theme, ThemeManager
 
 SIDEBAR_TOC    = 0
 SIDEBAR_SEARCH = 1
@@ -163,6 +164,37 @@ _READER_CSS_JS = """
 })();
 """
 
+# 阅读区域的"夜间模式"：只强制背景色和默认文字色，不去逐个元素纠正
+# （代码块、特殊高亮文字这类原书自带样式可能会显得不协调，但这是几乎
+# 所有 epub 阅读器"一键夜间模式"的通用做法，取舍上足够好用）。
+# 用固定 id 的 <style> 标签存放规则，切换主题时只需要改它的 textContent，
+# 不需要整页重新加载。
+_READER_DARK_CSS_JS = f"""
+(function() {{
+    let style = document.getElementById('marginalia-dark-mode');
+    if (!style) {{
+        style = document.createElement('style');
+        style.id = 'marginalia-dark-mode';
+        document.head.appendChild(style);
+    }}
+    style.textContent = `
+        html, body {{
+            background: {DARK.reader_bg} !important;
+            color: {DARK.text} !important;
+        }}
+        a, a:visited {{ color: #6cb2ff !important; }}
+    `;
+}})();
+"""
+
+# 切回浅色模式时，直接把注入的夜间样式表摘掉，还原书本原始配色
+_READER_LIGHT_CSS_JS = """
+(function() {
+    const style = document.getElementById('marginalia-dark-mode');
+    if (style) { style.remove(); }
+})();
+"""
+
 
 class ReaderPage(QWebEnginePage):
     """
@@ -203,9 +235,14 @@ class MainWindow(QMainWindow):
         self.highlight_store: HighlightStore | None = None
         self._current_note_id: int | None = None
 
+        self._theme_mgr = ThemeManager.instance()
+
         self._build_ui()
         self._build_shortcuts()
         self.sidebar_container.setVisible(False)
+
+        self._apply_theme(self._theme_mgr.current)
+        self._theme_mgr.changed.connect(self._on_theme_changed)
 
     # ------------------------------------------------------------------
     # UI 搭建
@@ -219,17 +256,16 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        root_layout.addWidget(self._build_toolbar())
+        self.toolbar = self._build_toolbar()
+        root_layout.addWidget(self.toolbar)
 
         # --- 主体：侧边栏 + 阅读区域，用 Splitter 让宽度可拖拽 ---
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter = self.main_splitter
         splitter.setHandleWidth(1)
-        splitter.setStyleSheet("QSplitter::handle { background-color: #e5e5e5; }")
 
         self.sidebar_container = self._build_sidebar()
         self.web_view = QWebEngineView()
-        self.web_view.setStyleSheet("background-color: #fdfdfb;")
         self.reader_page = ReaderPage(
             on_reach_bottom=self._on_chapter_scrolled_to_bottom,
             on_highlight_msg=self._on_highlight_message,
@@ -251,19 +287,6 @@ class MainWindow(QMainWindow):
     def _build_toolbar(self) -> QWidget:
         toolbar = QWidget()
         toolbar.setFixedHeight(44)
-        toolbar.setStyleSheet(
-            """
-            QWidget { background-color: #fafafa; border-bottom: 1px solid #e5e5e5; }
-            QPushButton {
-                border: none; background: transparent;
-                font-size: 16px; color: #333; padding: 0 14px;
-            }
-            QPushButton:hover { color: #000; }
-            QPushButton:disabled { color: #ccc; }
-            QPushButton:checked { color: #000; font-weight: bold; }
-            QLabel#title { font-size: 13px; color: #444; font-weight: 500; }
-            """
-        )
         layout = QHBoxLayout(toolbar)
         layout.setContentsMargins(8, 0, 8, 0)
 
@@ -314,6 +337,12 @@ class MainWindow(QMainWindow):
         self.btn_edit.setEnabled(False)
         self.btn_edit.clicked.connect(self._open_epub_editor)
 
+        # 暗黑模式切换：图标随当前主题变化（暗色下显示"点了会变亮"的太阳，
+        # 浅色下显示"点了会变暗"的月亮），文字在 _apply_theme 里同步更新
+        self.btn_theme = QPushButton()
+        self.btn_theme.setToolTip("切换深色/浅色模式")
+        self.btn_theme.clicked.connect(self._theme_mgr.toggle)
+
         layout.addWidget(self.btn_back)
         layout.addWidget(self.btn_open)
         layout.addWidget(self.btn_toc)
@@ -324,6 +353,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.btn_next)
         layout.addWidget(self.btn_info)
         layout.addWidget(self.btn_edit)
+        layout.addWidget(self.btn_theme)
 
         return toolbar
 
@@ -335,9 +365,6 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setMinimumWidth(200)
         container.setMaximumWidth(420)
-        container.setStyleSheet(
-            "background-color: #f5f5f3; border-right: 1px solid #e5e5e5;"
-        )
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -357,13 +384,6 @@ class MainWindow(QMainWindow):
 
         self.toc_tree = QTreeWidget()
         self.toc_tree.setHeaderHidden(True)
-        self.toc_tree.setStyleSheet(
-            """
-            QTreeWidget { border: none; background-color: transparent; font-size: 13px; color: #333; }
-            QTreeWidget::item { padding: 5px 4px; color: #333; }
-            QTreeWidget::item:selected { background-color: #e8e6df; color: #000; }
-            """
-        )
         self.toc_tree.itemClicked.connect(self._on_toc_item_clicked)
         layout.addWidget(self.toc_tree)
         return panel
@@ -376,30 +396,14 @@ class MainWindow(QMainWindow):
 
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索全书…")
-        self.search_input.setStyleSheet(
-            """
-            QLineEdit {
-                border: 1px solid #d8d6cf; border-radius: 6px;
-                padding: 6px 10px; font-size: 13px; background: white;
-            }
-            """
-        )
         # 输入即搜，不需要额外按回车，体验更顺手
         self.search_input.textChanged.connect(self._on_search_text_changed)
 
         self.search_results_list = QListWidget()
-        self.search_results_list.setStyleSheet(
-            """
-            QListWidget { border: none; background-color: transparent; font-size: 12px; color: #333; }
-            QListWidget::item { padding: 8px 4px; border-bottom: 1px solid #ebe9e3; color: #333; }
-            QListWidget::item:selected { background-color: #e8e6df; color: #000; }
-            """
-        )
         self.search_results_list.setWordWrap(True)
         self.search_results_list.itemClicked.connect(self._on_search_result_clicked)
 
         self.search_status_label = QLabel("")
-        self.search_status_label.setStyleSheet("color: #888; font-size: 11px;")
 
         layout.addWidget(self.search_input)
         layout.addWidget(self.search_status_label)
@@ -415,24 +419,12 @@ class MainWindow(QMainWindow):
         header_row = QHBoxLayout()
         header_row.setContentsMargins(14, 0, 10, 6)
 
-        header = QLabel("笔记")
-        header.setStyleSheet(
-            "font-size: 12px; color: #888; font-weight: 500;"
-        )
-        header_row.addWidget(header)
+        self.notes_header_label = QLabel("笔记")
+        header_row.addWidget(self.notes_header_label)
         header_row.addStretch()
 
         export_btn = QPushButton("导出")
         export_btn.setToolTip("导出全部笔记为 Markdown")
-        export_btn.setStyleSheet("""
-            QPushButton {
-                border: 1px solid #d8d6cf; border-radius: 5px;
-                padding: 2px 10px; font-size: 11px; color: #555;
-                background: white;
-            }
-            QPushButton:hover { background: #f0eeea; }
-            QPushButton:disabled { color: #ccc; border-color: #e5e3dd; }
-        """)
         export_btn.clicked.connect(self._export_notes)
         self.btn_export_notes = export_btn
         header_row.addWidget(export_btn)
@@ -442,11 +434,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(header_widget)
 
         self.notes_list = QListWidget()
-        self.notes_list.setStyleSheet("""
-            QListWidget { border: none; background-color: transparent; font-size: 12px; }
-            QListWidget::item { padding: 8px 12px; border-bottom: 1px solid #ebe9e3; }
-            QListWidget::item:selected { background-color: #e8e6df; color: #000; }
-        """)
         self.notes_list.setWordWrap(True)
         self.notes_list.itemClicked.connect(self._on_notes_list_item_clicked)
         layout.addWidget(self.notes_list, stretch=1)
@@ -457,54 +444,30 @@ class MainWindow(QMainWindow):
         self.note_drawer = QWidget()
         self.note_drawer.setFixedWidth(300)
         self.note_drawer.setVisible(False)
-        self.note_drawer.setStyleSheet(
-            "background: #faf9f7; border-left: 1px solid #e5e5e5;"
-        )
         layout = QVBoxLayout(self.note_drawer)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
         header_row = QHBoxLayout()
-        header_lbl = QLabel("笔记")
-        header_lbl.setStyleSheet("font-size: 14px; font-weight: 600; color: #1a1a1a;")
-        close_btn = QPushButton("✕")
-        close_btn.setStyleSheet(
-            "border: none; background: transparent; color: #aaa; font-size: 14px;"
-        )
-        close_btn.clicked.connect(self._close_note_drawer)
-        header_row.addWidget(header_lbl)
+        self.note_drawer_title = QLabel("笔记")
+        self.btn_close_note = QPushButton("✕")
+        self.btn_close_note.clicked.connect(self._close_note_drawer)
+        header_row.addWidget(self.note_drawer_title)
         header_row.addStretch()
-        header_row.addWidget(close_btn)
+        header_row.addWidget(self.btn_close_note)
         layout.addLayout(header_row)
 
         self.note_quote_label = QLabel("")
         self.note_quote_label.setWordWrap(True)
-        self.note_quote_label.setStyleSheet(
-            "font-size: 12px; color: #888; font-style: italic; "
-            "background: #f0ede6; border-radius: 4px; padding: 8px;"
-        )
         layout.addWidget(self.note_quote_label)
 
         self.note_edit = QTextEdit()
         self.note_edit.setPlaceholderText("写下你的想法…")
-        self.note_edit.setStyleSheet("""
-            QTextEdit {
-                border: 1px solid #d8d6cf; border-radius: 6px;
-                padding: 8px; font-size: 13px; background: white;
-            }
-        """)
         layout.addWidget(self.note_edit, stretch=1)
 
-        save_btn = QPushButton("保存笔记")
-        save_btn.setStyleSheet("""
-            QPushButton {
-                background: #2c2c2c; color: white; border: none;
-                border-radius: 6px; padding: 8px; font-size: 13px;
-            }
-            QPushButton:hover { background: #111; }
-        """)
-        save_btn.clicked.connect(self._save_note)
-        layout.addWidget(save_btn)
+        self.btn_save_note = QPushButton("保存笔记")
+        self.btn_save_note.clicked.connect(self._save_note)
+        layout.addWidget(self.btn_save_note)
         return self.note_drawer
 
     def _build_shortcuts(self) -> None:
@@ -528,6 +491,114 @@ class MainWindow(QMainWindow):
         act_find.setShortcut(QKeySequence.StandardKey.Find)
         act_find.triggered.connect(self._toggle_search_sidebar)
         self.addAction(act_find)
+
+    # ------------------------------------------------------------------
+    # 主题（深色/浅色）
+    # ------------------------------------------------------------------
+
+    def _on_theme_changed(self, theme: Theme) -> None:
+        self._apply_theme(theme)
+        self._apply_reader_dark_mode()
+
+    def _apply_theme(self, t: Theme) -> None:
+        """把当前主题的颜色 token 灌进所有手动 setStyleSheet 的控件里。
+        初次构建界面时调用一次，切换深色/浅色时再整体调用一次。"""
+
+        self.main_splitter.setStyleSheet(
+            f"QSplitter::handle {{ background-color: {t.border}; }}"
+        )
+        self.web_view.setStyleSheet(f"background-color: {t.reader_bg};")
+
+        self.toolbar.setStyleSheet(f"""
+            QWidget {{ background-color: {t.bg_toolbar}; border-bottom: 1px solid {t.border}; }}
+            QPushButton {{
+                border: none; background: transparent;
+                font-size: 16px; color: {t.text_secondary}; padding: 0 14px;
+            }}
+            QPushButton:hover {{ color: {t.text}; }}
+            QPushButton:disabled {{ color: {t.text_muted}; }}
+            QPushButton:checked {{ color: {t.text}; font-weight: bold; }}
+            QLabel#title {{ font-size: 13px; color: {t.text_secondary}; font-weight: 500; }}
+        """)
+        self.btn_theme.setText("☀️" if t.is_dark else "🌙")
+
+        self.sidebar_container.setStyleSheet(
+            f"background-color: {t.bg_sidebar}; border-right: 1px solid {t.border};"
+        )
+
+        self.toc_tree.setStyleSheet(f"""
+            QTreeWidget {{ border: none; background-color: transparent; font-size: 13px; color: {t.text}; }}
+            QTreeWidget::item {{ padding: 5px 4px; color: {t.text}; }}
+            QTreeWidget::item:selected {{ background-color: {t.bg_selected}; color: {t.text}; }}
+        """)
+
+        self.search_input.setStyleSheet(f"""
+            QLineEdit {{
+                border: 1px solid {t.border_input}; border-radius: 6px;
+                padding: 6px 10px; font-size: 13px;
+                background: {t.bg_input}; color: {t.text};
+            }}
+        """)
+        self.search_results_list.setStyleSheet(f"""
+            QListWidget {{ border: none; background-color: transparent; font-size: 12px; color: {t.text}; }}
+            QListWidget::item {{ padding: 8px 4px; border-bottom: 1px solid {t.border}; color: {t.text}; }}
+            QListWidget::item:selected {{ background-color: {t.bg_selected}; color: {t.text}; }}
+        """)
+        self.search_status_label.setStyleSheet(f"color: {t.text_muted}; font-size: 11px;")
+
+        self.notes_header_label.setStyleSheet(
+            f"font-size: 12px; color: {t.text_muted}; font-weight: 500;"
+        )
+        self.btn_export_notes.setStyleSheet(f"""
+            QPushButton {{
+                border: 1px solid {t.border_input}; border-radius: 5px;
+                padding: 2px 10px; font-size: 11px; color: {t.text_secondary};
+                background: {t.bg_input};
+            }}
+            QPushButton:hover {{ background: {t.bg_hover}; }}
+            QPushButton:disabled {{ color: {t.text_muted}; border-color: {t.border}; }}
+        """)
+        self.notes_list.setStyleSheet(f"""
+            QListWidget {{ border: none; background-color: transparent; font-size: 12px; color: {t.text}; }}
+            QListWidget::item {{ padding: 8px 12px; border-bottom: 1px solid {t.border}; color: {t.text}; }}
+            QListWidget::item:selected {{ background-color: {t.bg_selected}; color: {t.text}; }}
+        """)
+
+        self.note_drawer.setStyleSheet(
+            f"background: {t.bg_sidebar}; border-left: 1px solid {t.border};"
+        )
+        self.note_drawer_title.setStyleSheet(
+            f"font-size: 14px; font-weight: 600; color: {t.text};"
+        )
+        self.btn_close_note.setStyleSheet(
+            f"border: none; background: transparent; color: {t.text_muted}; font-size: 14px;"
+        )
+        self.note_quote_label.setStyleSheet(
+            f"font-size: 12px; color: {t.text_secondary}; font-style: italic; "
+            f"background: {t.bg_hover}; border-radius: 4px; padding: 8px;"
+        )
+        self.note_edit.setStyleSheet(f"""
+            QTextEdit {{
+                border: 1px solid {t.border_input}; border-radius: 6px;
+                padding: 8px; font-size: 13px; background: {t.bg_input}; color: {t.text};
+            }}
+        """)
+        self.btn_save_note.setStyleSheet(f"""
+            QPushButton {{
+                background: {t.button_primary_bg}; color: {t.button_primary_text}; border: none;
+                border-radius: 6px; padding: 8px; font-size: 13px;
+            }}
+            QPushButton:hover {{ background: {t.button_primary_hover}; }}
+        """)
+
+    def _apply_reader_dark_mode(self) -> None:
+        """给当前已加载的章节页面注入/移除夜间模式样式。
+        不用重新加载整个页面（会丢失滚动位置），只是往页面里插一个
+        <style> 标签（见 _READER_DARK_CSS_JS / _READER_LIGHT_CSS_JS）。"""
+        if self.book is None:
+            return
+        js = _READER_DARK_CSS_JS if self._theme_mgr.current.is_dark else _READER_LIGHT_CSS_JS
+        self.web_view.page().runJavaScript(js)
 
     # ------------------------------------------------------------------
     # 侧边栏显示/隐藏逻辑
@@ -654,6 +725,7 @@ class MainWindow(QMainWindow):
             hl_js = _HIGHLIGHTER_JS_PATH.read_text(encoding="utf-8")
             page.runJavaScript(hl_js)
 
+        self._apply_reader_dark_mode()
         self._restore_highlights()
 
     def _restore_highlights(self) -> None:

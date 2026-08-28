@@ -38,6 +38,7 @@ from core.epub_writer import (
     temp_path_to_zip_name,
     write_chapters,
 )
+from ui.theme import DARK, Theme, ThemeManager
 
 # 注入到编辑页面的 JS：开启 contenteditable，注入最小样式
 _EDIT_INIT_JS = """
@@ -80,6 +81,33 @@ _EDIT_INIT_JS = """
 })();
 """
 
+# 编辑区域的夜间模式：跟阅读器的 _READER_DARK_CSS_JS 是同一套思路，
+# 用固定 id 的 <style> 标签，切主题时只改 textContent，不用重新加载页面
+# （重新加载会打断正在编辑的内容和撤销历史）。
+_EDITOR_DARK_CSS_JS = f"""
+(function() {{
+    let style = document.getElementById('marginalia-editor-dark');
+    if (!style) {{
+        style = document.createElement('style');
+        style.id = 'marginalia-editor-dark';
+        document.head.appendChild(style);
+    }}
+    style.textContent = `
+        html, body {{
+            background: {DARK.reader_bg} !important;
+            color: {DARK.text} !important;
+        }}
+    `;
+}})();
+"""
+
+_EDITOR_LIGHT_CSS_JS = """
+(function() {
+    const style = document.getElementById('marginalia-editor-dark');
+    if (style) { style.remove(); }
+})();
+"""
+
 
 # 序列化当前 DOM 为 HTML 字符串，供保存时写回 epub 使用。
 #
@@ -97,6 +125,9 @@ _GET_HTML_JS = """
 
     const styleTag = clone.getElementById('marginalia-editor-style');
     if (styleTag) { styleTag.remove(); }
+
+    const darkStyleTag = clone.getElementById('marginalia-editor-dark');
+    if (darkStyleTag) { darkStyleTag.remove(); }
 
     if (clone.body) {
         clone.body.removeAttribute('contenteditable');
@@ -151,8 +182,13 @@ class EpubEditorWindow(QMainWindow):
         self.setWindowTitle(f"编辑 — {book.title}")
         self.resize(1100, 820)
 
+        self._theme_mgr = ThemeManager.instance()
+
         self._build_ui()
         self._build_shortcuts()
+
+        self._apply_theme(self._theme_mgr.current)
+        self._theme_mgr.changed.connect(self._on_theme_changed)
 
         # 默认打开第一章
         if book.chapter_count() > 0:
@@ -172,10 +208,8 @@ class EpubEditorWindow(QMainWindow):
         root.addWidget(self._build_toolbar())
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter = splitter
         splitter.setHandleWidth(1)
-        splitter.setStyleSheet(
-            "QSplitter::handle { background: #e5e5e5; }"
-        )
 
         splitter.addWidget(self._build_chapter_list())
         splitter.addWidget(self._build_editor_area())
@@ -187,32 +221,14 @@ class EpubEditorWindow(QMainWindow):
 
     def _build_toolbar(self) -> QWidget:
         bar = QWidget()
+        self._toolbar = bar
         bar.setFixedHeight(44)
-        bar.setStyleSheet("""
-            QWidget   { background: #fafafa; border-bottom: 1px solid #e5e5e5; }
-            QPushButton {
-                border: none; background: transparent;
-                font-size: 14px; color: #333; padding: 0 12px; min-width: 32px;
-            }
-            QPushButton:hover   { color: #000; background: #f0eeea; border-radius: 4px; }
-            QPushButton:pressed { background: #e8e6e1; }
-            QPushButton:disabled { color: #bbb; }
-            QLabel { font-size: 13px; color: #666; }
-        """)
         row = QHBoxLayout(bar)
         row.setContentsMargins(10, 0, 10, 0)
         row.setSpacing(2)
 
         # 保存
         self.btn_save = QPushButton("保存")
-        self.btn_save.setStyleSheet("""
-            QPushButton {
-                background: #2c2c2c; color: white; border-radius: 6px;
-                padding: 0 16px; font-size: 13px; min-width: 56px;
-            }
-            QPushButton:hover   { background: #111; }
-            QPushButton:disabled { background: #bbb; }
-        """)
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self._save_current)
         row.addWidget(self.btn_save)
@@ -248,37 +264,26 @@ class EpubEditorWindow(QMainWindow):
         self.status_label = QLabel("选择左侧章节开始编辑")
         row.addWidget(self.status_label)
 
+        # 暗黑模式切换（跟阅读器主窗口共用同一个 ThemeManager，
+        # 这里切一下，阅读器那边也会跟着变）
+        self.btn_theme = QPushButton()
+        self.btn_theme.setToolTip("切换深色/浅色模式")
+        self.btn_theme.clicked.connect(self._theme_mgr.toggle)
+        row.addWidget(self.btn_theme)
+
         return bar
 
     def _build_chapter_list(self) -> QWidget:
         panel = QWidget()
-        panel.setStyleSheet("background: #f5f4f1;")
+        self._chapter_panel = panel
         vbox = QVBoxLayout(panel)
         vbox.setContentsMargins(0, 8, 0, 0)
         vbox.setSpacing(0)
 
-        header = QLabel("章节")
-        header.setStyleSheet(
-            "font-size: 11px; color: #999; font-weight: 600;"
-            "padding: 0 14px 6px; letter-spacing: 0.5px;"
-        )
-        vbox.addWidget(header)
+        self._chapter_header = QLabel("章节")
+        vbox.addWidget(self._chapter_header)
 
         self.chapter_list = QListWidget()
-        self.chapter_list.setStyleSheet("""
-            QListWidget {
-                border: none; background: transparent; font-size: 13px;
-            }
-            QListWidget::item {
-                padding: 8px 14px; color: #333; border-radius: 0;
-            }
-            QListWidget::item:selected {
-                background: #e8e6df; color: #000;
-            }
-            QListWidget::item:hover:!selected {
-                background: #eeece7;
-            }
-        """)
 
         for ch in self.book.chapters:
             item = QListWidgetItem(ch.title or f"章节 {ch.index + 1}")
@@ -310,6 +315,67 @@ class EpubEditorWindow(QMainWindow):
         save_act.setShortcut(QKeySequence.StandardKey.Save)
         save_act.triggered.connect(self._save_current)
         self.addAction(save_act)
+
+    # ------------------------------------------------------------------
+    # 主题（深色/浅色）
+    # ------------------------------------------------------------------
+
+    def _on_theme_changed(self, theme: Theme) -> None:
+        self._apply_theme(theme)
+        self._apply_editor_dark_mode()
+
+    def _apply_theme(self, t: Theme) -> None:
+        self._splitter.setStyleSheet(
+            f"QSplitter::handle {{ background: {t.border}; }}"
+        )
+        self._toolbar.setStyleSheet(f"""
+            QWidget   {{ background: {t.bg_toolbar}; border-bottom: 1px solid {t.border}; }}
+            QPushButton {{
+                border: none; background: transparent;
+                font-size: 14px; color: {t.text_secondary}; padding: 0 12px; min-width: 32px;
+            }}
+            QPushButton:hover   {{ color: {t.text}; background: {t.bg_hover}; border-radius: 4px; }}
+            QPushButton:pressed {{ background: {t.bg_selected}; }}
+            QPushButton:disabled {{ color: {t.text_muted}; }}
+            QLabel {{ font-size: 13px; color: {t.text_secondary}; }}
+        """)
+        self.btn_save.setStyleSheet(f"""
+            QPushButton {{
+                background: {t.button_primary_bg}; color: {t.button_primary_text}; border-radius: 6px;
+                padding: 0 16px; font-size: 13px; min-width: 56px;
+            }}
+            QPushButton:hover   {{ background: {t.button_primary_hover}; }}
+            QPushButton:disabled {{ background: {t.text_muted}; }}
+        """)
+        self.btn_theme.setText("☀️" if t.is_dark else "🌙")
+
+        self._chapter_panel.setStyleSheet(f"background: {t.bg_sidebar};")
+        self._chapter_header.setStyleSheet(
+            f"font-size: 11px; color: {t.text_muted}; font-weight: 600;"
+            "padding: 0 14px 6px; letter-spacing: 0.5px;"
+        )
+        self.chapter_list.setStyleSheet(f"""
+            QListWidget {{
+                border: none; background: transparent; font-size: 13px; color: {t.text};
+            }}
+            QListWidget::item {{
+                padding: 8px 14px; color: {t.text}; border-radius: 0;
+            }}
+            QListWidget::item:selected {{
+                background: {t.bg_selected}; color: {t.text};
+            }}
+            QListWidget::item:hover:!selected {{
+                background: {t.bg_hover};
+            }}
+        """)
+
+    def _apply_editor_dark_mode(self) -> None:
+        """给当前正在编辑的章节内容注入/移除夜间模式样式（不重新加载页面，
+        避免打断正在编辑的内容和撤销历史）。"""
+        if self._current_idx is None:
+            return
+        js = _EDITOR_DARK_CSS_JS if self._theme_mgr.current.is_dark else _EDITOR_LIGHT_CSS_JS
+        self.web_view.page().runJavaScript(js)
 
     # ------------------------------------------------------------------
     # 章节加载
@@ -372,6 +438,7 @@ class EpubEditorWindow(QMainWindow):
         self.web_view.page().runJavaScript(_EDIT_INIT_JS)
         chapter = self.book.chapters[self._current_idx]
         self.status_label.setText(chapter.title or f"章节 {self._current_idx + 1}")
+        self._apply_editor_dark_mode()
 
     def _on_editor_dirty(self) -> None:
         """JS 检测到内容变化，标记未保存状态"""
@@ -446,4 +513,8 @@ class EpubEditorWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.No:
                 event.ignore()
                 return
+        try:
+            self._theme_mgr.changed.disconnect(self._on_theme_changed)
+        except (RuntimeError, TypeError):
+            pass
         event.accept()

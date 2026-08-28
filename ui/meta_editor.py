@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.epub_meta import EpubMeta, read_meta, write_meta
+from ui.theme import Theme, ThemeManager
 
 
 def _short_date(value: str) -> str:
@@ -59,7 +60,15 @@ class MetaEditorDialog(QDialog):
         self.setModal(True)
 
         self._meta = read_meta(epub_path)
+        self._theme_mgr = ThemeManager.instance()
         self._build_ui()
+        self._apply_theme(self._theme_mgr.current)
+        self._theme_mgr.changed.connect(self._apply_theme)
+        # 对话框关闭后就没用了，及时断开，不然 ThemeManager 会一直
+        # 持有一个指向已销毁窗口的连接
+        self.finished.connect(
+            lambda _: self._theme_mgr.changed.disconnect(self._apply_theme)
+        )
 
     # ------------------------------------------------------------------
     # 构建 UI
@@ -71,11 +80,8 @@ class MetaEditorDialog(QDialog):
         root.setContentsMargins(24, 20, 24, 20)
 
         # 标题
-        heading = QLabel("书籍信息")
-        heading.setStyleSheet(
-            "font-size: 16px; font-weight: 600; color: #1a1a1a;"
-        )
-        root.addWidget(heading)
+        self._heading = QLabel("书籍信息")
+        root.addWidget(self._heading)
 
         # 表单
         form = QFormLayout()
@@ -85,29 +91,19 @@ class MetaEditorDialog(QDialog):
             QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
         )
 
-        _field_style = """
-            QLineEdit, QPlainTextEdit {
-                border: 1px solid #d8d6cf;
-                border-radius: 6px;
-                padding: 6px 10px;
-                font-size: 13px;
-                background: white;
-                color: #1a1a1a;
-            }
-            QLineEdit:focus, QPlainTextEdit:focus {
-                border-color: #888;
-            }
-        """
-        _label_style = "font-size: 13px; color: #555;"
+        # 表单里的输入框/说明文字标签，按主题重新上色时要挨个遍历，
+        # 所以在构建时把它们都收集进这两个列表
+        self._field_widgets: list[QLineEdit | QPlainTextEdit] = []
+        self._label_widgets: list[QLabel] = []
 
         def _line(value: str) -> QLineEdit:
             w = QLineEdit(value)
-            w.setStyleSheet(_field_style)
+            self._field_widgets.append(w)
             return w
 
         def _label(text: str) -> QLabel:
             l = QLabel(text)
-            l.setStyleSheet(_label_style)
+            self._label_widgets.append(l)
             return l
 
         self._f_title     = _line(self._meta.title)
@@ -118,7 +114,7 @@ class MetaEditorDialog(QDialog):
         self._f_date.setPlaceholderText("YYYY-MM-DD")
 
         self._f_description = QPlainTextEdit(self._meta.description)
-        self._f_description.setStyleSheet(_field_style)
+        self._field_widgets.append(self._f_description)
         self._f_description.setFixedHeight(90)
         self._f_description.setPlaceholderText("简介（可选）")
 
@@ -130,43 +126,77 @@ class MetaEditorDialog(QDialog):
         form.addRow(_label("简介"), self._f_description)
 
         # identifier 只读展示
+        self._id_label = None
         if self._meta.identifier:
-            id_label = QLabel(self._meta.identifier)
-            id_label.setStyleSheet("font-size: 12px; color: #aaa;")
-            id_label.setTextInteractionFlags(
+            self._id_label = QLabel(self._meta.identifier)
+            self._id_label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse
             )
-            form.addRow(_label("ISBN / ID"), id_label)
+            form.addRow(_label("ISBN / ID"), self._id_label)
 
         root.addLayout(form)
 
         # 按钮
         self._error_label = QLabel("")
-        self._error_label.setStyleSheet("color: #c00; font-size: 12px;")
         self._error_label.setVisible(False)
         root.addWidget(self._error_label)
 
-        buttons = QDialogButtonBox(
+        self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save |
             QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.setStyleSheet("""
-            QPushButton {
-                border: 1px solid #d0cec8; border-radius: 6px;
-                padding: 6px 20px; font-size: 13px; background: white;
-                color: #333; min-width: 72px;
-            }
-            QPushButton:hover { background: #f5f4f0; }
-            QPushButton[text="保存"] {
-                background: #2c2c2c; color: white; border-color: #2c2c2c;
-            }
-            QPushButton[text="保存"]:hover { background: #111; }
+        self._buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
+        self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self._buttons.accepted.connect(self._save)
+        self._buttons.rejected.connect(self.reject)
+        root.addWidget(self._buttons)
+
+    # ------------------------------------------------------------------
+    # 主题
+    # ------------------------------------------------------------------
+
+    def _apply_theme(self, t: Theme) -> None:
+        self.setStyleSheet(f"QDialog {{ background: {t.bg}; }}")
+        self._heading.setStyleSheet(
+            f"font-size: 16px; font-weight: 600; color: {t.text};"
+        )
+        for lbl in self._label_widgets:
+            lbl.setStyleSheet(f"font-size: 13px; color: {t.text_secondary};")
+
+        field_style = f"""
+            QLineEdit, QPlainTextEdit {{
+                border: 1px solid {t.border_input};
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 13px;
+                background: {t.bg_input};
+                color: {t.text};
+            }}
+            QLineEdit:focus, QPlainTextEdit:focus {{
+                border-color: {t.text_muted};
+            }}
+        """
+        for w in self._field_widgets:
+            w.setStyleSheet(field_style)
+
+        if self._id_label is not None:
+            self._id_label.setStyleSheet(f"font-size: 12px; color: {t.text_muted};")
+
+        self._error_label.setStyleSheet(f"color: {t.danger}; font-size: 12px;")
+
+        self._buttons.setStyleSheet(f"""
+            QPushButton {{
+                border: 1px solid {t.border_input}; border-radius: 6px;
+                padding: 6px 20px; font-size: 13px; background: {t.bg_input};
+                color: {t.text_secondary}; min-width: 72px;
+            }}
+            QPushButton:hover {{ background: {t.bg_hover}; }}
+            QPushButton[text="保存"] {{
+                background: {t.button_primary_bg}; color: {t.button_primary_text};
+                border-color: {t.button_primary_bg};
+            }}
+            QPushButton[text="保存"]:hover {{ background: {t.button_primary_hover}; }}
         """)
-        buttons.accepted.connect(self._save)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
 
     # ------------------------------------------------------------------
     # 保存

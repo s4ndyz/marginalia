@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.library import BookRecord, get_all_books, import_book, remove_book
+from ui.theme import Theme, ThemeManager
 
 COVER_W   = 148
 COVER_H   = 210
@@ -73,14 +74,16 @@ def _cover_pixmap(cover_path: str) -> QPixmap:
 class BookCard(QFrame):
     """一张书卡：封面 + 书名 + 作者，单击打开，右键移除"""
 
-    def __init__(self, rec: BookRecord, on_open, on_remove, parent=None):
+    def __init__(self, rec: BookRecord, on_open, on_remove, theme: Theme, parent=None):
         super().__init__(parent)
         self.rec = rec
         self._on_open   = on_open
         self._on_remove = on_remove
+        self._theme     = theme
         self._build()
 
     def _build(self):
+        t = self._theme
         self.setFixedWidth(CARD_W)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setStyleSheet("""
@@ -96,9 +99,9 @@ class BookCard(QFrame):
         cover_lbl.setFixedSize(COVER_W, COVER_H)
         cover_lbl.setScaledContents(False)
         cover_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        cover_lbl.setStyleSheet("""
+        cover_lbl.setStyleSheet(f"""
             border-radius: 5px;
-            background: #e8e5de;
+            background: {t.bg_hover};
         """)
 
         if self.rec.cover_path and Path(self.rec.cover_path).exists():
@@ -130,7 +133,7 @@ class BookCard(QFrame):
         title_lbl.setMaximumHeight(36)
         title_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         title_lbl.setStyleSheet(
-            "font-size: 12px; font-weight: 600; color: #1a1a1a; background: transparent;"
+            f"font-size: 12px; font-weight: 600; color: {t.text}; background: transparent;"
         )
         vbox.addWidget(title_lbl)
 
@@ -139,7 +142,7 @@ class BookCard(QFrame):
         author_lbl.setFixedWidth(COVER_W)
         author_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft)
         author_lbl.setStyleSheet(
-            "font-size: 11px; color: #888; background: transparent;"
+            f"font-size: 11px; color: {t.text_muted}; background: transparent;"
         )
         vbox.addWidget(author_lbl)
 
@@ -150,17 +153,18 @@ class BookCard(QFrame):
         super().mousePressEvent(ev)
 
     def contextMenuEvent(self, ev):
+        t = self._theme
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background: white; border: 1px solid #ddd;
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: {t.bg}; border: 1px solid {t.border};
                 border-radius: 8px; padding: 4px;
-            }
-            QMenu::item {
+            }}
+            QMenu::item {{
                 padding: 7px 18px; font-size: 13px;
-                color: #333; border-radius: 4px;
-            }
-            QMenu::item:selected { background: #f0ede6; }
+                color: {t.text}; border-radius: 4px;
+            }}
+            QMenu::item:selected {{ background: {t.bg_hover}; }}
         """)
         act = menu.addAction("从书库移除（不删除文件）")
         if menu.exec(ev.globalPos()) == act:
@@ -173,8 +177,16 @@ class LibraryView(QWidget):
         super().__init__(parent)
         self._on_open_book  = on_open_book
         self._all_records: list[BookRecord] = []
+        self._theme_mgr = ThemeManager.instance()
         self._build_ui()
+        self._apply_theme(self._theme_mgr.current)
+        self._theme_mgr.changed.connect(self._on_theme_changed)
         self.refresh()
+
+    def _on_theme_changed(self, theme: Theme) -> None:
+        self._apply_theme(theme)
+        # 卡片颜色是构建时写死进去的，主题变了得重新渲染一遍卡片
+        self._apply_filter()
 
     # ------------------------------------------------------------------
     # 构建
@@ -192,12 +204,8 @@ class LibraryView(QWidget):
         self._scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self._scroll.setStyleSheet(
-            "QScrollArea { border: none; background: #f7f6f3; }"
-        )
 
         self._grid_host = QWidget()
-        self._grid_host.setStyleSheet("background: #f7f6f3;")
         self._grid = QGridLayout(self._grid_host)
         self._grid.setContentsMargins(36, 36, 36, 36)
         self._grid.setHorizontalSpacing(GRID_GAP)
@@ -208,50 +216,57 @@ class LibraryView(QWidget):
 
     def _build_toolbar(self) -> QWidget:
         bar = QWidget()
+        self._toolbar = bar
         bar.setFixedHeight(56)
-        bar.setStyleSheet(
-            "background: #fafafa; border-bottom: 1px solid #e5e5e5;"
-        )
         row = QHBoxLayout(bar)
         row.setContentsMargins(24, 0, 24, 0)
         row.setSpacing(12)
 
-        title = QLabel("书库")
-        title.setStyleSheet(
-            "font-size: 16px; font-weight: 600; color: #1a1a1a;"
-        )
-        row.addWidget(title)
+        self._title_label = QLabel("书库")
+        row.addWidget(self._title_label)
         row.addStretch()
 
         self._search_box = QLineEdit()
         self._search_box.setPlaceholderText("搜索书名或作者…")
         self._search_box.setFixedWidth(210)
-        self._search_box.setStyleSheet("""
-            QLineEdit {
-                border: 1px solid #d8d6cf; border-radius: 7px;
-                padding: 6px 12px; font-size: 13px;
-                background: white; color: #333;
-            }
-            QLineEdit:focus { border-color: #aaa; }
-        """)
         self._timer = QTimer(self, singleShot=True)
         self._timer.timeout.connect(self._apply_filter)
         self._search_box.textChanged.connect(lambda: self._timer.start(200))
         row.addWidget(self._search_box)
 
-        btn = QPushButton("＋ 导入")
-        btn.setFixedHeight(34)
-        btn.setStyleSheet("""
-            QPushButton {
-                background: #2c2c2c; color: white; border: none;
-                border-radius: 7px; padding: 0 18px; font-size: 13px;
-            }
-            QPushButton:hover  { background: #111; }
-            QPushButton:pressed{ background: #000; }
-        """)
-        btn.clicked.connect(self._import_dialog)
-        row.addWidget(btn)
+        self._import_btn = QPushButton("＋ 导入")
+        self._import_btn.setFixedHeight(34)
+        self._import_btn.clicked.connect(self._import_dialog)
+        row.addWidget(self._import_btn)
         return bar
+
+    def _apply_theme(self, t: Theme) -> None:
+        self._toolbar.setStyleSheet(
+            f"background: {t.bg_toolbar}; border-bottom: 1px solid {t.border};"
+        )
+        self._title_label.setStyleSheet(
+            f"font-size: 16px; font-weight: 600; color: {t.text};"
+        )
+        self._search_box.setStyleSheet(f"""
+            QLineEdit {{
+                border: 1px solid {t.border_input}; border-radius: 7px;
+                padding: 6px 12px; font-size: 13px;
+                background: {t.bg_input}; color: {t.text};
+            }}
+            QLineEdit:focus {{ border-color: {t.text_muted}; }}
+        """)
+        self._import_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {t.button_primary_bg}; color: {t.button_primary_text}; border: none;
+                border-radius: 7px; padding: 0 18px; font-size: 13px;
+            }}
+            QPushButton:hover  {{ background: {t.button_primary_hover}; }}
+            QPushButton:pressed {{ background: {t.button_primary_hover}; }}
+        """)
+        self._scroll.setStyleSheet(
+            f"QScrollArea {{ border: none; background: {t.bg_sidebar}; }}"
+        )
+        self._grid_host.setStyleSheet(f"background: {t.bg_sidebar};")
 
     # ------------------------------------------------------------------
     # 数据 / 渲染
@@ -277,10 +292,12 @@ class LibraryView(QWidget):
             if w:
                 w.deleteLater()
 
+        t = self._theme_mgr.current
+
         if not records:
             lbl = QLabel("书库是空的\n点击右上角「＋ 导入」添加第一本书")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("font-size: 14px; color: #bbb; line-height: 2;")
+            lbl.setStyleSheet(f"font-size: 14px; color: {t.text_muted}; line-height: 2;")
             self._grid.addWidget(lbl, 0, 0, 1, GRID_COLS,
                                  Qt.AlignmentFlag.AlignCenter)
             return
@@ -290,6 +307,7 @@ class LibraryView(QWidget):
                 rec,
                 on_open=self._on_open_book,
                 on_remove=self._on_remove,
+                theme=t,
             )
             self._grid.addWidget(card, i // GRID_COLS, i % GRID_COLS)
 
